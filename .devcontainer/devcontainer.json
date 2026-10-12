@@ -9,6 +9,9 @@
 // container's entrypoint, so postStartCommand applies it (`potatos
 // codespaces-setup`). Do NOT put a password in containerEnv below: this file
 // is committed, and may be public.
+// Idle: GitHub's idle timeout ignores forwarded-port traffic (raise it in
+// Settings -> Codespaces). A POTATOS_GH_TOKEN secret (PAT with the `codespace`
+// scope) lets PotatOS stop the codespace itself after 10 idle minutes.
 {
   "name": "PotatOS",
   "build": {
@@ -19,7 +22,7 @@
   "overrideCommand": false,
   "runArgs": ["--shm-size=1g"],
   "containerEnv": {
-    "POTATOS_PROFILE": "balanced",
+    "POTATOS_PROFILE": "auto",
     "TZ": "Etc/UTC"
   },
   "forwardPorts": [3000],

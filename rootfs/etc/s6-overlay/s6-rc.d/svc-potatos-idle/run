@@ -1,0 +1,379 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# potatos-idle - put the desktop to sleep when nobody is watching.
+#
+# Runs as root as the s6-rc longrun `svc-potatos-idle` (this directory; the
+# Dockerfile copies it with the rest of rootfs/). It depends on svc-de, the
+# desktop service, AND on svc-dbus, the system bus: at shutdown s6 then stops
+# THIS service first, so the session checkpoint in the SIGTERM trap runs while
+# xfce4-session and the browser are still alive, and `docker stop` / a
+# redeploy restores exactly what was open. (Measured: without the svc-dbus
+# dependency s6 stops the system bus in parallel and the desktop dies with it
+# within 50 ms; a /custom-services.d service would only depend on
+# init-services and be stopped at the same moment as the desktop.)
+#
+# Every POLL seconds it counts ESTABLISHED TCP connections to the Selkies
+# server (nginx -> selkies WebSocket on 127.0.0.1:CUSTOM_WS_PORT) by reading
+# /proc/net/tcp{,6} with bash builtins only, so a poll costs ~1 ms and no fork.
+#
+#   no viewer for POTATOS_IDLE_MINUTES (default 10, 0 = off)  ->  ACTION
+#     freeze : 1. ask xfce4-session to checkpoint the session (so a later
+#                 cold boot restores the open apps, see potatos-session),
+#              2. SIGSTOP every process of the desktop user except the
+#                 streaming core (Xvfb, selkies, pulseaudio, dbus, cupsd),
+#              3. SIGKILL the browser's network-service process so its open
+#                 sockets close: the kernel keeps sending TCP keepalives for a
+#                 stopped process, and Railway Serverless only sleeps a service
+#                 that sends 0 outbound packets. The frozen browser restarts the
+#                 service on resume (Chromium: ~1 s, pages reload fine).
+#     halt   : checkpoint, then stop the whole container (exit code 0). Only
+#              useful where exit 0 is NOT restarted (restart: on-failure).
+#     log    : only log what would happen (nothing is frozen or stopped).
+#   viewer connects, a successful page request (2xx) hits nginx, or SIGTERM
+#   ->  SIGCONT all. A 401 from a scanner or a 404 does not wake the desktop.
+#
+# The session is also checkpointed when the viewer disconnects and every
+# CHECKPOINT_EVERY seconds while one is connected, so a SIGKILL (platform
+# sleep, OOM) loses at most that much.
+#
+# Quiet hours (POTATOS_QUIET_HOURS="01-07", local TZ, off by default): inside
+# the window the idle timeout is 1 minute, and a connected viewer that has sent
+# no input for POTATOS_QUIET_INPUT_MINUTES (5) after connecting is also frozen
+# (X screensaver idle time via the Xlib bundled with selkies); input or a page
+# load thaws. A window with start == end is rejected (it would mean "always").
+#
+# Codespaces: if `potatos codespaces-setup` stored a POTATOS_GH_TOKEN secret in
+# /config/.potatos/gh-token (and the codespace name next to it), the codespace
+# is also stopped through the GitHub REST API once the idle timeout hits, for
+# the freeze and halt actions only: not for action=log, a manual
+# `potatos idle pause` or a quiet-hours input-idle freeze (failures are logged).
+#
+# Control: SIGUSR1 = freeze now, SIGUSR2 = resume (`potatos idle pause|resume`).
+# State for `potatos idle status`: /run/potatos-idle/state
+#
+# Env: POTATOS_IDLE_MINUTES (10)  POTATOS_IDLE_SECONDS (overrides, for tests)
+#      POTATOS_IDLE_ACTION freeze|halt|log  POTATOS_QUIET_HOURS ""  POTATOS_QUIET_INPUT_MINUTES (5)
+#      POTATOS_IDLE_POLL_SECONDS (1)  POTATOS_IDLE_PAGE_GRACE (60: seconds a page
+#      load keeps the desktop awake when no WebSocket follows)
+#      POTATOS_IDLE_CHECKPOINT_SECONDS (300: periodic checkpoint while a viewer is connected)
+
+log() { echo "[potatos-idle] $*"; }
+# A disabled watcher just sleeps; `potatos idle pause|resume` (SIGUSR1/2) must
+# not kill it, or s6 would restart it in a loop.
+off() { log "$1"; trap '' USR1 USR2; exec sleep infinity; }
+
+# Numbers only: a non-integer here would be a bash arithmetic error, and s6
+# would restart the service in a loop.
+for v in POTATOS_IDLE_MINUTES POTATOS_IDLE_SECONDS POTATOS_QUIET_INPUT_MINUTES POTATOS_IDLE_POLL_SECONDS POTATOS_IDLE_PAGE_GRACE POTATOS_IDLE_CHECKPOINT_SECONDS; do
+  if [ -n "${!v:-}" ] && ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
+    off "WARNING: ${v}='${!v}' is not a whole number: idle watcher off"
+  fi
+done
+IDLE="${POTATOS_IDLE_SECONDS:-$(( ${POTATOS_IDLE_MINUTES:-10} * 60 ))}"
+ACTION="${POTATOS_IDLE_ACTION:-freeze}"
+POLL="${POTATOS_IDLE_POLL_SECONDS:-1}"
+GRACE="${POTATOS_IDLE_PAGE_GRACE:-60}"
+CHECKPOINT_EVERY="${POTATOS_IDLE_CHECKPOINT_SECONDS:-300}"
+QUIET="${POTATOS_QUIET_HOURS:-}"
+QUIET_INPUT_S=$(( ${POTATOS_QUIET_INPUT_MINUTES:-5} * 60 ))
+WS_PORT="${CUSTOM_WS_PORT:-8082}"
+DESK_USER="${CUSTOM_USER:-abc}"
+ACCESS_LOG=/var/log/nginx/access.log
+STATE=/run/potatos-idle
+FROZEN_LIST="${STATE}/frozen"
+APPS_FILE=/config/.cache/sessions/potatos-apps   # browsers running at the last checkpoint
+GH_TOKEN_FILE=/config/.potatos/gh-token
+GH_NAME_FILE=/config/.potatos/codespace-name
+# Never stopped: the streaming core and the buses it talks to (comm names,
+# truncated to 15 chars by the kernel), and the `potatos` CLI itself, so
+# `potatos idle pause` run by the desktop user can still print the result.
+KEEP_COMM=" Xvfb pulseaudio gsettings-helpe dbus-daemon dbus-launch cupsd potatos "
+# The Docker HEALTHCHECK (potatos-healthcheck) connects to the Selkies port
+# from these source ports; such a connection is not a viewer.
+PROBE_PORT_MIN=65000; PROBE_PORT_MAX=65010
+
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh    # browser_of_comm (browser names differ per image)
+
+if ! [ "${IDLE}" -gt 0 ] 2>/dev/null || [ "${ACTION}" = "off" ]; then
+  off "disabled (POTATOS_IDLE_MINUTES=0)"
+fi
+
+mkdir -p "${STATE}"
+DESK_UID="$(id -u "${DESK_USER}" 2>/dev/null || id -u abc)"
+HEXPORT="$(printf '%04X' "${WS_PORT}")"
+exec {SLEEP_FD}<> <(:)          # `read -t` on this = sleep without forking
+nap() { read -r -t "$1" -u "${SLEEP_FD}" _; }
+
+# --- quiet hours ----------------------------------------------------------
+QSTART=-1; QEND=-1
+if [ -n "${QUIET}" ]; then
+  if [[ "${QUIET}" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]] && [ "${BASH_REMATCH[1]}" -le 24 ] && [ "${BASH_REMATCH[2]}" -le 24 ] \
+     && [ $((10#${BASH_REMATCH[1]} % 24)) -ne $((10#${BASH_REMATCH[2]} % 24)) ]; then
+    QSTART=$((10#${BASH_REMATCH[1]} % 24)); QEND=$((10#${BASH_REMATCH[2]} % 24))
+    log "quiet hours $(printf '%02d:00-%02d:00' "${QSTART}" "${QEND}") (${TZ:-UTC}): 1 min idle timeout, input-idle viewers frozen after $((QUIET_INPUT_S / 60)) min"
+  else
+    log "WARNING: ignoring POTATOS_QUIET_HOURS='${QUIET}' (use HH-HH with different hours, e.g. 01-07)"
+  fi
+fi
+in_quiet_hours() {              # 0 = yes. %(%H)T is a bash builtin (no fork)
+  local h; [ "${QSTART}" -ge 0 ] || return 1
+  printf -v h '%(%H)T' -1; h=$((10#${h}))
+  if [ "${QSTART}" -lt "${QEND}" ]; then [ "${h}" -ge "${QSTART}" ] && [ "${h}" -lt "${QEND}" ]
+  else [ "${h}" -ge "${QSTART}" ] || [ "${h}" -lt "${QEND}" ]; fi
+}
+x_idle_s() {                    # seconds since the last X input (XTEST input from the viewer counts)
+  local ms
+  ms="$(s6-setuidgid "${DESK_USER}" with-contenv /lsiopy/bin/python3 -c \
+    'from selkies.Xlib import display; from selkies.Xlib.ext import screensaver; print(display.Display().screen().root.screensaver_query_info().idle)' 2>/dev/null)" || ms=0
+  echo $(( ${ms:-0} / 1000 ))
+}
+
+# --- viewer detection -----------------------------------------------------
+CLIENTS=0
+# ESTABLISHED (st 01) sockets whose LOCAL port is the Selkies port = one per
+# viewer WebSocket. mapfile + one regex ~1 ms; a `while read` costs ~5 ms, so
+# the per-line loop (to skip the health probe's source ports) only runs when
+# the fast regex found a candidate at all.
+WS_RE=":${HEXPORT} [0-9A-F]+:([0-9A-F]+) 01 "
+count_clients() {
+  local f lines l p
+  CLIENTS=0
+  for f in /proc/net/tcp /proc/net/tcp6; do      # tcp6 is missing without IPv6
+    [ -r "${f}" ] || continue
+    mapfile -t lines < "${f}"
+    [[ "${lines[*]}" =~ ${WS_RE} ]] || continue
+    for l in "${lines[@]}"; do
+      [[ "${l}" =~ ${WS_RE} ]] || continue
+      p=$((16#${BASH_REMATCH[1]}))
+      [ "${p}" -ge "${PROBE_PORT_MIN}" ] && [ "${p}" -le "${PROBE_PORT_MAX}" ] && continue
+      CLIENTS=1; return
+    done
+  done
+}
+
+starttime() {                   # field 22 of /proc/PID/stat: guards against PID reuse
+  local s; s="$(< "/proc/$1/stat")" 2>/dev/null || return 1
+  s="${s##*) }"
+  # shellcheck disable=SC2086
+  set -- ${s}
+  echo "${20}"
+}
+
+# --- session checkpoint ---------------------------------------------------
+# xfce4-session saves its XSMP clients (terminal, editor, file manager...) on
+# request. Browsers are not XSMP clients, so we also note which ones run;
+# potatos-session relaunches them at the next login with their own session
+# restore (Chromium --restore-last-session, Firefox browser.startup.page=3).
+checkpoint() {
+  local pid addr apps="" d comm saved=0 cands=()
+  LAST_CHECKPOINT=${SECONDS}
+  pid="$(pgrep -x -u "${DESK_UID}" xfce4-session | head -1)" || true
+  [ -n "${pid}" ] || return 0
+  # The session bus address lives in xfce4-session's environment, readable
+  # only with CAP_SYS_PTRACE (not in Docker's default set; the braces keep
+  # bash's "Permission denied" out of the log). Then try the session buses'
+  # sockets in /tmp (Debian starts xfce4-session under its own `dbus-launch
+  # --exit-with-session`, a different bus than the X11 autolaunch one), and
+  # last the X11 autolaunch bus (the one Alpine's session uses). A wrong bus
+  # answers "ServiceUnknown" at once, so this costs nothing.
+  addr="$({ tr '\0' '\n' < "/proc/${pid}/environ"; } 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')"
+  [ -n "${addr}" ] && cands+=("${addr}")
+  for d in /tmp/dbus-*; do [ -S "${d}" ] && cands+=("unix:path=${d}"); done
+  cands+=("")
+  for addr in "${cands[@]}"; do
+    if timeout 15 s6-setuidgid "${DESK_USER}" with-contenv env ${addr:+DBUS_SESSION_BUS_ADDRESS="${addr}"} \
+         dbus-send --session --print-reply --reply-timeout=10000 --dest=org.xfce.SessionManager \
+         /org/xfce/SessionManager org.xfce.Session.Manager.Checkpoint string:"" >/dev/null 2>&1; then
+      saved=1; break
+    fi
+  done
+  if [ "${saved}" = 1 ]; then log "session checkpoint saved ($1)"; else log "WARNING: session checkpoint failed ($1)"; fi
+  for d in /proc/[0-9]*; do
+    comm="$(< "${d}/comm")" 2>/dev/null || continue
+    comm="$(browser_of_comm "${comm}")"    # chromium | firefox | chrome | brave | ""
+    [ -n "${comm}" ] && [[ " ${apps} " != *" ${comm} "* ]] && apps="${apps} ${comm}"
+  done
+  # At shutdown ($2 = keep) a browser may already be gone: never replace a
+  # recorded list with an empty one then.
+  [ "${2:-}" = keep ] && [ -z "${apps}" ] && return 0
+  mkdir -p "$(dirname "${APPS_FILE}")"
+  printf '%s\n' "${apps# }" > "${APPS_FILE}"
+  chown "${DESK_UID}" "${APPS_FILE}" "$(dirname "${APPS_FILE}")" 2>/dev/null || true
+}
+
+# --- freeze / thaw --------------------------------------------------------
+write_state() { printf 'state=%s\nsince=%s\nreason="%s"\nclients=%s\nidle_seconds=%s\naction=%s\n' "$1" "${EPOCHSECONDS}" "$2" "${CLIENTS}" "${IDLE}" "${ACTION}" > "${STATE}/state"; }
+
+freeze() {
+  local d pid uid comm cmd key val n=0 cut=0
+  : > "${FROZEN_LIST}"
+  for d in /proc/[0-9]*; do
+    pid="${d#/proc/}"
+    uid=""
+    while read -r key val _; do [ "${key}" = "Uid:" ] && { uid="${val}"; break; }; done 2>/dev/null < "${d}/status"
+    [ "${uid}" = "${DESK_UID}" ] || continue
+    comm="$(< "${d}/comm")" 2>/dev/null || continue
+    [[ "${KEEP_COMM}" == *" ${comm} "* ]] && continue
+    cmd="$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)"
+    [[ "${cmd}" == *bin/selkies* ]] && continue
+    [[ "$(< "${d}/stat")" == *") T "* ]] 2>/dev/null && continue   # already stopped (Ctrl-Z)
+    if kill -STOP "${pid}" 2>/dev/null; then
+      echo "${pid} $(starttime "${pid}")" >> "${FROZEN_LIST}"; n=$((n + 1))
+    fi
+  done
+  # Close the browsers' sockets: the network service of Chromium / Chrome /
+  # Brave, Firefox's socket process. The browsers respawn it when they continue.
+  for d in /proc/[0-9]*; do
+    cmd="$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)"
+    if [[ "${cmd}" == *--utility-sub-type=network.mojom.NetworkService* ]] || [[ "${cmd}" == *firefox*" socket " ]]; then
+      kill -KILL "${d#/proc/}" 2>/dev/null && cut=$((cut + 1))
+    fi
+  done
+  FROZEN=1
+  write_state frozen "$1"
+  log "suspended: froze ${n} desktop processes, closed ${cut} browser network service(s) ($1)"
+}
+
+thaw() {
+  local pid st n=0
+  FROZEN=0; REASON=""
+  write_state active "$1"
+  [ -s "${FROZEN_LIST}" ] || { rm -f "${FROZEN_LIST}"; return; }
+  while read -r pid st; do
+    [ "$(starttime "${pid}" 2>/dev/null)" = "${st}" ] || continue
+    kill -CONT "${pid}" 2>/dev/null && n=$((n + 1))
+  done < "${FROZEN_LIST}"
+  rm -f "${FROZEN_LIST}"
+  log "resumed ${n} desktop processes ($1)"
+}
+
+# The codespace name is visible to devcontainer lifecycle scripts (which is
+# where `potatos codespaces-setup` saves it) but not always to services.
+CS_NAME="${CODESPACE_NAME:-$(cat "${GH_NAME_FILE}" 2>/dev/null)}"
+if [ -r "${GH_TOKEN_FILE}" ]; then
+  if [ -n "${CS_NAME}" ]; then log "codespace ${CS_NAME} will be stopped after the idle timeout (POTATOS_GH_TOKEN found)"
+  else log "WARNING: POTATOS_GH_TOKEN found but no codespace name: run 'potatos codespaces-setup'"; fi
+fi
+stop_codespace() {
+  [ -n "${CS_NAME}" ] && [ -r "${GH_TOKEN_FILE}" ] || return 0
+  local code
+  # The token goes in through curl's config on stdin, not the command line
+  # (which every user in the container can read in /proc/*/cmdline).
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "$(< "${GH_TOKEN_FILE}")" \
+    | curl --config - -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+      -H 'Accept: application/vnd.github+json' "https://api.github.com/user/codespaces/${CS_NAME}/stop" 2>/dev/null)"
+  case "${code}" in
+    200) log "codespace ${CS_NAME}: stop requested" ;;
+    ''|000) log "WARNING: could not reach api.github.com to stop codespace ${CS_NAME}" ;;
+    *) log "WARNING: could not stop codespace ${CS_NAME} (HTTP ${code}); check the POTATOS_GH_TOKEN scope" ;;
+  esac
+}
+
+suspend() {                     # the idle timeout (or SIGUSR1) hit; $1 = reason, $2 = idle -> also stop the codespace
+  case "${ACTION}" in
+    freeze) checkpoint "$1"; freeze "$1"; [ "${2:-}" = idle ] && stop_codespace ;;
+    halt)   checkpoint "$1"; [ "${2:-}" = idle ] && stop_codespace
+            log "no viewer for ${IDLE}s: stopping the container"; /run/s6/basedir/bin/halt; exec sleep infinity ;;
+    *)      log "idle ($1): action '${ACTION}', nothing done"; LAST_ACTIVE=${SECONDS} ;;
+  esac
+}
+
+# --- main loop ------------------------------------------------------------
+FROZEN=0; WANT=""; REASON=""
+[ -e "${FROZEN_LIST}" ] && thaw "watcher restarted"
+# docker stop / s6 shutdown: thaw so the apps get their SIGTERM, and save the
+# session so the next boot restores it (s6 stops this service before svc-de,
+# so xfce4-session and the browsers are still there to be recorded).
+trap 'thaw "watcher stopping"; checkpoint shutdown keep; exit 0' TERM INT
+trap 'WANT=pause' USR1
+trap 'WANT=resume' USR2
+[ "${GRACE}" -gt "${IDLE}" ] && GRACE=${IDLE}
+# nginx (re)creates its access log at start: arm the page-request trigger only
+# after that, or boot itself would count as a visit. (pgrep rather than the
+# pid file: Alpine uses /run/nginx/nginx.pid, Debian /run/nginx.pid.)
+for _ in $(seq 1 120); do pgrep -x nginx >/dev/null 2>&1 && break; nap 1; done
+nap 2
+: > "${STATE}/seen"
+LOG_POS="$(stat -c %s "${ACCESS_LOG}" 2>/dev/null || echo 0)"
+write_state active boot
+
+# Did a request that is really a visit reach nginx since the last poll? Only
+# the new lines of the access log count, and only 2xx / 101 (WebSocket) / 304
+# answers: a 401 from an internet scanner or a 404 must not thaw the desktop
+# (and restart the browser's network service) every time.
+page_requested() {
+  local new size
+  [[ -e ${ACCESS_LOG} && ${ACCESS_LOG} -nt ${STATE}/seen ]] || return 1
+  : > "${STATE}/seen"
+  size="$(stat -c %s "${ACCESS_LOG}" 2>/dev/null || echo 0)"
+  [ "${size}" -lt "${LOG_POS}" ] && LOG_POS=0          # log truncated / rotated
+  new="$(tail -c +$((LOG_POS + 1)) "${ACCESS_LOG}" 2>/dev/null)"
+  LOG_POS=${size}
+  [[ "${new}" =~ \"\ (2[0-9][0-9]|101|304)\  ]]
+}
+
+log "watching 127.0.0.1:${WS_PORT}: '${ACTION}' after ${IDLE}s without a viewer (poll ${POLL}s)"
+LAST_ACTIVE=${SECONDS}
+LAST_CHECKPOINT=${SECONDS}
+WAS_CONNECTED=-1
+CONNECTED_AT=${SECONDS}
+LAST_XCHECK=0
+while :; do
+  LIMIT=${IDLE}
+  in_quiet_hours && LIMIT=60
+  count_clients
+  if [ "${CLIENTS}" -gt 0 ]; then
+    LAST_ACTIVE=${SECONDS}
+    # (a manual pause or a quiet-hours input-idle freeze keeps the connected
+    #  viewer frozen: those thaw on a page load, input, or `potatos idle resume`)
+    [ "${FROZEN}" = 1 ] && [ "${REASON}" = "no viewer" ] && thaw "viewer connected"
+    # A redeploy or SIGKILL while someone works loses at most CHECKPOINT_EVERY.
+    if [ "${FROZEN}" = 0 ] && [ $((SECONDS - LAST_CHECKPOINT)) -ge "${CHECKPOINT_EVERY}" ]; then checkpoint periodic; fi
+  elif page_requested; then
+    # A page load precedes its WebSocket by ~0.5 s: wake early, but keep the
+    # desktop awake only G seconds unless a viewer really connects (G = GRACE
+    # capped at the effective timeout, which is 60 s in quiet hours).
+    G=${GRACE}; [ "${G}" -gt "${LIMIT}" ] && G=${LIMIT}
+    [ "${LAST_ACTIVE}" -lt $((SECONDS - LIMIT + G)) ] && LAST_ACTIVE=$((SECONDS - LIMIT + G))
+    [ "${FROZEN}" = 1 ] && thaw "page requested"
+  fi
+  if [ "${CLIENTS}" -gt 0 ] && [ "${WAS_CONNECTED}" != 1 ]; then
+    log "viewer connected"; WAS_CONNECTED=1; CONNECTED_AT=${SECONDS}; LAST_XCHECK=0
+    write_state "$([ "${FROZEN}" = 1 ] && echo frozen || echo active)" viewer
+  elif [ "${CLIENTS}" = 0 ] && [ "${WAS_CONNECTED}" != 0 ]; then
+    log "no viewer; ${ACTION} in ${LIMIT}s"
+    # The viewer left: save what is open now (a platform sleep may follow).
+    [ "${WAS_CONNECTED}" = 1 ] && [ "${FROZEN}" = 0 ] && checkpoint "viewer left"
+    WAS_CONNECTED=0
+    write_state "$([ "${FROZEN}" = 1 ] && echo frozen || echo active)" "no viewer"
+  fi
+
+  case "${WANT}" in
+    pause)  WANT=""; [ "${FROZEN}" = 0 ] && { REASON="manual"; log "pause requested"; suspend "potatos idle pause"; } ;;
+    resume) WANT=""; [ "${FROZEN}" = 1 ] && { thaw "potatos idle resume"; LAST_ACTIVE=${SECONDS}; } ;;
+  esac
+
+  # Quiet hours: a viewer who is connected but idle at night is frozen, and
+  # thawed on input; the thaw check also runs once the window is over, so a
+  # viewer frozen at 06:59 is not stuck at 07:00.
+  if [ "${CLIENTS}" -gt 0 ] && { in_quiet_hours || { [ "${FROZEN}" = 1 ] && [ "${REASON}" = "input idle" ]; }; }; then
+    XEVERY=30; [ "${FROZEN}" = 1 ] && XEVERY=5
+    if [ $((SECONDS - LAST_XCHECK)) -ge "${XEVERY}" ]; then
+      LAST_XCHECK=${SECONDS}
+      XIDLE="$(x_idle_s)"
+      # (X's idle clock also counts the time before the viewer connected, so
+      #  require the viewer to have been connected that long as well)
+      if [ "${FROZEN}" = 0 ] && [ "${XIDLE}" -ge "${QUIET_INPUT_S}" ] && [ $((SECONDS - CONNECTED_AT)) -ge "${QUIET_INPUT_S}" ]; then
+        REASON="input idle"; suspend "quiet hours, no input for $((XIDLE / 60)) min"
+      elif [ "${FROZEN}" = 1 ] && [ "${REASON}" = "input idle" ] && { [ "${XIDLE}" -lt "${QUIET_INPUT_S}" ] || ! in_quiet_hours; }; then
+        thaw "$(in_quiet_hours && echo "input received" || echo "quiet hours over")"
+      fi
+    fi
+  fi
+  if [ "${FROZEN}" = 0 ] && [ "${CLIENTS}" = 0 ] && [ $((SECONDS - LAST_ACTIVE)) -ge "${LIMIT}" ]; then
+    REASON="no viewer"; suspend "no viewer for ${LIMIT}s" idle
+  fi
+  nap "${POLL}"
+done

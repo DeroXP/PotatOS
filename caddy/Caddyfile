@@ -1,0 +1,35 @@
+# PotatOS GPU host: Caddy in front of the desktop container (docker-compose.gpu.yml).
+#
+# Caddy gets and renews a Let's Encrypt certificate for POTATOS_DOMAIN by
+# itself (TLS-ALPN on 443, or HTTP-01 on 80 when that port is forwarded too)
+# and proxies everything, WebSockets included, to nginx inside the desktop
+# container. Login (basic auth), the WebSocket origin guard and /healthz are
+# handled by PotatOS itself, so this file stays short.
+#
+# No ACME e-mail is configured: Let's Encrypt does not need one (and stopped
+# sending expiry mails in 2025), and an `email` line with an empty value is a
+# parse error that would keep Caddy from starting. To add one anyway:
+#   { email you@yourdomain.tld }   (not an example.com address, LE rejects those)
+#
+# Rate limiting: stock Caddy has no request rate limiter (it needs the
+# caddy-ratelimit plugin, i.e. a custom build). What protects the login here
+# is a long random PASSWORD; the access log below (`docker compose logs
+# caddy`) shows every request if you want to watch for guessing.
+
+{$POTATOS_DOMAIN} {
+	log {
+		output stdout
+		format console
+	}
+	header {
+		# Browsers remember to use HTTPS only (1 year)
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+		-Server
+	}
+	reverse_proxy potatos-gpu:3000 {
+		# the desktop container sees the real client address in X-Forwarded-For
+		flush_interval -1
+	}
+}

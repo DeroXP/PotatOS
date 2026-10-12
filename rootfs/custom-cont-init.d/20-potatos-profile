@@ -3,8 +3,21 @@
 #
 # PotatOS: streaming performance profiles.
 #
-#   POTATOS_PROFILE = potato | balanced (default) | ultra | custom
+#   POTATOS_PROFILE = auto (default) | potato | balanced | ultra | custom
 #   POTATOS_RESOLUTION = auto | <width>x<height>   (optional, e.g. 1920x1080)
+#
+# 'auto' picks from the vCPU count (software x264 scales with pixels x fps and
+# uses at most 4 threads, see the README's performance table). The count is
+# min(nproc, cgroup CPU quota): `docker run --cpus 2` and PaaS plans limit
+# with a quota on a bigger host, which nproc alone does not see (lib.sh).
+#   <= 2 vCPU : 30 fps initial (up to 60), fixed 1280x720 scaled to the window
+#   3-4  vCPU : 30 fps initial (up to 60), window-sized (1080p-friendly)
+#   >= 5 vCPU : balanced, 60 fps initial (up to 120)
+#   CODESPACES=true never starts above 60 fps.
+# Speed defaults shared by every profile (measured, see bench/): Turbo
+# ("stream every frame") locked off, CRF 28 (about -27% bandwidth vs 25 and
+# -8% encoder CPU, same fps; CRF 30 would be -42%), compositor off (base
+# image default), Opus at 64/96/128 kbps.
 #
 # A profile only fills in Selkies settings the user did NOT set. Anything you
 # pass yourself as SELKIES_<NAME>=... always wins. Values are written to
@@ -14,9 +27,12 @@
 # Selkies range syntax: "initial,min-max" (e.g. "60,8-120"). The user can still
 # move framerate/quality inside that range from the in-browser sidebar.
 
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh        # cpu_count
 ENV_DIR=/run/s6/container_environment
-PROFILE="${POTATOS_PROFILE:-balanced}"
+PROFILE="${POTATOS_PROFILE:-auto}"
 PROFILE="${PROFILE,,}"
+CPUS="$(cpu_count)"
 
 # Set NAME=VALUE for Selkies unless NAME is already present in the environment.
 set_default() {
@@ -46,7 +62,32 @@ set_encoders() {
 # "false", "0", "no", "off" (optionally with a "|locked" suffix) -> true
 is_off() { case "${1%%|*}" in false|False|FALSE|0|no|No|off|Off) return 0 ;; *) return 1 ;; esac; }
 
+# (Turbo mode, SELKIES_VIDEO_STREAMING_MODE, is locked off in the Dockerfile:
+#  the base image already sets it to "false", so it cannot be a profile default.)
+echo "[potatos]   SELKIES_VIDEO_STREAMING_MODE=${SELKIES_VIDEO_STREAMING_MODE:-default} (Turbo$( [ "${SELKIES_VIDEO_STREAMING_MODE}" = "false|locked" ] && echo " locked off" || echo ", your setting"))"
+
 case "${PROFILE}" in
+  auto)
+    if [ "${CPUS}" -le 2 ]; then
+      DEFAULT_RES="1280x720"
+      echo "[potatos] Profile 'auto' on ${CPUS} vCPU: 30 fps (max 60), 720p scaled to the window"
+      set_default SELKIES_FRAMERATE      "30,8-60"
+    elif [ "${CPUS}" -le 4 ]; then
+      DEFAULT_RES="auto"
+      echo "[potatos] Profile 'auto' on ${CPUS} vCPU: 30 fps (max 60), window-sized"
+      set_default SELKIES_FRAMERATE      "30,8-60"
+    else
+      # (>= 5 vCPU; a Codespace still never starts above 60 fps)
+      DEFAULT_RES="auto"
+      echo "[potatos] Profile 'auto' on ${CPUS} vCPU: balanced (60 fps, max 120, window-sized)"
+      set_default SELKIES_FRAMERATE      "60,8-120"
+    fi
+    set_default SELKIES_VIDEO_CRF      "28,5-50"
+    set_default SELKIES_VIDEO_BITRATE  "8000,100-1000000"
+    set_default SELKIES_AUDIO_BITRATE  "96000"
+    set_default SELKIES_USE_CSS_SCALING "true"
+    set_encoders "${ALL_ENCODERS}"
+    ;;
   potato)
     # Weak client and/or weak server: 720p, 30 fps, lower bitrate, and only
     # codecs that every cheap laptop / old phone decodes in hardware or cheaply.
@@ -59,6 +100,7 @@ case "${PROFILE}" in
     set_default SELKIES_FRAMERATE      "30,8-30"
     set_default SELKIES_VIDEO_CRF      "30,26-50"
     set_default SELKIES_VIDEO_BITRATE  "3000,500-6000"
+    set_default SELKIES_AUDIO_BITRATE  "64000"
     set_default SELKIES_USE_CSS_SCALING "true"
     set_encoders "h264enc,vp8enc,jpeg"
     ;;
@@ -68,8 +110,9 @@ case "${PROFILE}" in
     DEFAULT_RES="auto"
     echo "[potatos] Profile 'balanced' (60 fps, window-sized, medium bitrate)"
     set_default SELKIES_FRAMERATE      "60,8-120"
-    set_default SELKIES_VIDEO_CRF      "25,5-50"
+    set_default SELKIES_VIDEO_CRF      "28,5-50"
     set_default SELKIES_VIDEO_BITRATE  "8000,100-1000000"
+    set_default SELKIES_AUDIO_BITRATE  "96000"
     set_default SELKIES_USE_CSS_SCALING "true"
     set_encoders "${ALL_ENCODERS}"
     ;;
@@ -85,6 +128,7 @@ case "${PROFILE}" in
     set_default SELKIES_FRAMERATE      "120,8-120"
     set_default SELKIES_VIDEO_CRF      "20,5-50"
     set_default SELKIES_VIDEO_BITRATE  "20000,100-1000000"
+    set_default SELKIES_AUDIO_BITRATE  "128000"
     set_default SELKIES_USE_CSS_SCALING "true"
     set_encoders "${ALL_ENCODERS}"
     ;;
@@ -138,3 +182,7 @@ else
   set_default SELKIES_WEBCAM_ON_START     "demand"
 fi
 printf '%s' "${PROFILE}" > "${ENV_DIR}/POTATOS_PROFILE"
+
+# Idle watcher settings, recorded so `potatos info` can show them (the service
+# itself reads the same variables).
+echo "[potatos] Idle: $( [ "${POTATOS_IDLE_MINUTES:-10}" = 0 ] && echo "off (POTATOS_IDLE_MINUTES=0)" || echo "${POTATOS_IDLE_ACTION:-freeze} after ${POTATOS_IDLE_MINUTES:-10} min without a viewer")${POTATOS_QUIET_HOURS:+, quiet hours ${POTATOS_QUIET_HOURS}}"

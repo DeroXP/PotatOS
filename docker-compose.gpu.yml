@@ -1,0 +1,102 @@
+# PotatOS on your own PC with an NVIDIA GPU, reachable from the internet.
+# Written for Windows 11 + Docker Desktop (WSL2 backend); works on Linux too.
+# Step by step: docs/gpu-host.md.
+#
+#   copy .env.gpu.example to .env and fill it in
+#   docker compose -f docker-compose.gpu.yml up -d --build
+#   open https://<POTATOS_DOMAIN>
+#
+# Two containers: the desktop (potatos-gpu, never published directly) and
+# Caddy, which owns ports 80/443, gets a Let's Encrypt certificate for
+# POTATOS_DOMAIN by itself and proxies HTTPS + WebSockets to the desktop.
+# Forward port 443 (and 80, optional) on your router to this PC.
+services:
+  potatos-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: potatos:gpu
+    container_name: potatos-gpu
+    # NVIDIA GPU. On Windows this is GPU paravirtualisation through WSL2: the
+    # container gets /dev/dxg and the driver's CUDA/NVENC libraries, so
+    # pixelflux can ENCODE on the GPU; apps still render on the CPU.
+    # Do NOT add /dev/dri here on Windows: WSL only has a dummy "vgem" node,
+    # and pixelflux would try VA-API on it instead of NVENC.
+    # (Newer Compose also accepts the shorter `gpus: all`.)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, video, utility]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+      - POTATOS_PROFILE=${POTATOS_PROFILE:-ultra}   # 120 fps, window-sized (2K on a 1440p screen)
+      # A login is mandatory on a public host: PASSWORD from .env, or a
+      # generated one (docker compose logs potatos-gpu, box "PotatOS login").
+      - PASSWORD=${PASSWORD:-}
+      - POTATOS_REQUIRE_PASSWORD=true
+      # The browser's origin as seen through Caddy; the WebSocket origin guard
+      # would otherwise reject it (Caddy forwards the Host header, so this is
+      # only a belt-and-braces entry; harmless if unused).
+      - SELKIES_ALLOWED_ORIGINS=https://${POTATOS_DOMAIN:?set POTATOS_DOMAIN in .env}
+      # Default browser + Browser launcher: chromium | firefox | chrome | brave
+      # (the last two after `potatos install-browser` inside the desktop)
+      - POTATOS_BROWSER=${POTATOS_BROWSER:-chromium}
+      # - POTATOS_IDLE_MINUTES=10       # freeze the desktop after N min without a viewer
+      # - POTATOS_RESOLUTION=2560x1440  # fixed size instead of following the window
+    volumes:
+      - potatos-config:/config
+    shm_size: "2gb"
+    expose:
+      - "3000"      # reached by caddy only; no host port
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: potatos-caddy
+    ports:
+      - "80:80"         # ACME HTTP-01 + redirect to HTTPS (optional, see docs)
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      - POTATOS_DOMAIN=${POTATOS_DOMAIN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data        # certificates (keep!)
+      - caddy-config:/config
+    depends_on:
+      - potatos-gpu
+    restart: unless-stopped
+
+  # Optional: dynamic DNS, if your home IP changes. Pick one, fill in .env,
+  # and uncomment. (Alternatively your router may have a DDNS client built in.)
+  #
+  # ddns:                                   # DuckDNS (free subdomain)
+  #   image: lscr.io/linuxserver/duckdns:latest
+  #   container_name: potatos-ddns
+  #   environment:
+  #     - SUBDOMAINS=${DUCKDNS_SUBDOMAIN}   # "mydesktop" for mydesktop.duckdns.org
+  #     - TOKEN=${DUCKDNS_TOKEN}
+  #     - TZ=${TZ:-Etc/UTC}
+  #   restart: unless-stopped
+  #
+  # ddns:                                   # Cloudflare-hosted domain
+  #   image: favonia/cloudflare-ddns:latest
+  #   container_name: potatos-ddns
+  #   network_mode: host
+  #   environment:
+  #     - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}   # Zone:DNS:Edit
+  #     - DOMAINS=${POTATOS_DOMAIN}
+  #     - PROXIED=false                     # must stay false: a proxied (orange cloud) record would route the video through Cloudflare
+  #   restart: unless-stopped
+
+volumes:
+  potatos-config:
+  caddy-data:
+  caddy-config:

@@ -1,17 +1,23 @@
 #!/bin/bash
 # PotatOS: runs inside the XFCE session (as user abc) at login.
 #
-# Thunar/xfdesktop 4.20 show an "Untrusted application launcher" dialog for
-# desktop launchers unless their checksum is stored in GIO metadata
-# (metadata::xfce-exe-checksum). Writing that metadata goes through
-# gvfsd-metadata on the *session* D-Bus, which is why this must run from the
-# session's autostart: `gio set` from `docker exec` (no session bus) fails with
-# "Setting attribute ... not supported".
-# We mark only files that are byte-identical to the launchers PotatOS ships,
-# never arbitrary files the user (or a download) put on the desktop.
+# 1. Thunar/xfdesktop 4.20 show an "Untrusted application launcher" dialog for
+#    desktop launchers unless their checksum is stored in GIO metadata
+#    (metadata::xfce-exe-checksum). Writing that metadata goes through
+#    gvfsd-metadata on the *session* D-Bus, which is why this must run from the
+#    session's autostart: `gio set` from `docker exec` (no session bus) fails with
+#    "Setting attribute ... not supported".
+#    We mark only files that are byte-identical to the launchers PotatOS ships,
+#    never arbitrary files the user (or a download) put on the desktop.
+# 2. Session restore: xfce4-session brings back its own clients (terminal,
+#    editor...). Browsers are not session clients, so the potatos-idle service
+#    writes the ones that were running at its last checkpoint to
+#    ~/.cache/sessions/potatos-apps and we start them again here; each browser
+#    then restores its own tabs (see the chromium wrapper / Firefox policies).
 
 DESKTOP_DIR="${FILE_MANAGER_PATH:-${HOME}/Desktop}"
 LAUNCHERS=/usr/share/potatos/launchers
+APPS_FILE="${HOME}/.cache/sessions/potatos-apps"
 
 for src in "${LAUNCHERS}"/*.desktop; do
   f="${DESKTOP_DIR}/$(basename "${src}")"
@@ -23,4 +29,33 @@ for src in "${LAUNCHERS}"/*.desktop; do
       || echo "potatos-session: could not mark ${f} as trusted" >&2
   fi
 done
+
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh      # browser_bin / browser_running / browser_unlock
+# A fresh login means no browser from before is running: drop the profile
+# locks a previous container left behind (new host name, dead pids), which
+# would otherwise stop Chromium ("profile in use on another computer") and
+# Firefox ("already running") from starting at all.
+for app in chromium chrome brave firefox; do
+  browser_running "${app}" || browser_unlock "${app}" force
+done
+
+if [ -s "${APPS_FILE}" ]; then
+  read -r -a apps < "${APPS_FILE}"
+  rm -f "${APPS_FILE}"
+  for app in "${apps[@]}"; do
+    bin="$(browser_bin "${app}")" || continue
+    case "${app}" in
+      # Chromium family: explicit flag, because after a clean SIGTERM (docker
+      # stop) the profile says it exited normally and the wrapper would not add it.
+      chromium|chrome|brave) cmd=("${bin}" --restore-last-session) ;;
+      firefox)  cmd=("${bin}") ;;     # restores by policy (browser.startup.page=3)
+      *) continue ;;
+    esac
+    if ! browser_running "${app}"; then
+      echo "potatos-session: restoring ${app}"
+      setsid "${cmd[@]}" >/dev/null 2>&1 < /dev/null &
+    fi
+  done
+fi
 exit 0

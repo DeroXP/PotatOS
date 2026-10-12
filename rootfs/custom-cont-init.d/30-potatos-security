@@ -20,7 +20,8 @@
 # the desktop, because browsers re-send cached basic-auth credentials on its
 # cross-site WebSocket handshake. Selkies' same-origin check does.
 
-NGINX_CONFIG=/etc/nginx/http.d/default.conf
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh        # NGINX_CONFIG (Alpine or Debian path)
 ENV_DIR=/run/s6/container_environment
 STATE_DIR=/config/.potatos
 PW_FILE="${STATE_DIR}/generated-password"

@@ -3,8 +3,9 @@
 set -u
 
 ENV_DIR=/run/s6/container_environment
-NGINX_CONFIG=/etc/nginx/http.d/default.conf
 STATE_DIR=/config/.potatos
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh    # NGINX_CONFIG, POTATOS_PKG, pkg_*, browser_*
 
 # Read a variable the way the services see it (s6 container environment).
 envval() {
@@ -13,7 +14,7 @@ envval() {
 
 cmd_info() {
   local cpus mem_total mem_avail shm
-  cpus="$(nproc 2>/dev/null)"
+  cpus="$(cpu_count)"             # min(nproc, cgroup quota), see lib.sh
   mem_total="$(awk '/MemTotal/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
   mem_avail="$(awk '/MemAvailable/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
   shm="$(df -h /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
@@ -23,7 +24,7 @@ PotatOS
   Profile:     $(envval POTATOS_PROFILE)
   HTTP port:   $(envval POTATOS_HTTP_PORT) (HTTPS: $(envval CUSTOM_HTTPS_PORT | grep . || echo 3001))
   CPU:         ${cpus} vCPU   Memory: ${mem_avail} free of ${mem_total}   /dev/shm: ${shm}
-  GPU:         $( [ -e /dev/dri/renderD128 ] && echo "render node found (hardware encode possible)" || echo "none (software encoding)")
+  GPU:         $(gpu_line)
 Streaming (Selkies)
   Framerate:   $(envval SELKIES_FRAMERATE | grep . || echo "default")
   Video CRF:   $(envval SELKIES_VIDEO_CRF | grep . || echo "default")
@@ -31,21 +32,117 @@ Streaming (Selkies)
   Encoders:    $(envval SELKIES_ENCODER)
   Resolution:  $(r="$(envval SELKIES_MANUAL_WIDTH)"; [ -n "$r" ] && [ "$r" != 0 ] && echo "${r}x$(envval SELKIES_MANUAL_HEIGHT) (fixed)" || echo "follows browser window")
   Origins:     same-origin$(o="$(envval SELKIES_ALLOWED_ORIGINS)"; [ -n "$o" ] && echo " + $o")
+  Audio:       $(envval SELKIES_AUDIO_BITRATE | grep . || echo "default") bps   Turbo: $(envval SELKIES_VIDEO_STREAMING_MODE | grep . || echo "default")
   Mic/Webcam:  mic=$(envval SELKIES_MICROPHONE_ENABLED)/$(envval SELKIES_MICROPHONE_ON_START)  webcam=$(envval SELKIES_WEBCAM_ENABLED)/$(envval SELKIES_WEBCAM_ON_START)
+Energy / client (see README: Idle & sleep)
+  Idle:        $(m="$(envval POTATOS_IDLE_MINUTES)"; m="${m:-10}"; [ "$m" = 0 ] && echo off || echo "$(envval POTATOS_IDLE_ACTION | grep . || echo freeze) after ${m} min without a viewer")$(q="$(envval POTATOS_QUIET_HOURS)"; [ -n "$q" ] && echo ", quiet hours $q")
+  Browser tab: hidden $(envval POTATOS_HIDDEN_TAB_MINUTES | grep . || echo 10) min / idle $(envval POTATOS_TAB_IDLE_MINUTES | grep . || echo 30) min -> paused page
+  Eco mode:    $(envval POTATOS_ECO | grep . || echo on) (above 60 fps, after $(envval POTATOS_ECO_SECONDS | grep . || echo 30) s without input)
+  HUD:         $(envval POTATOS_HUD | grep . || echo on)   Privacy shade: $(envval POTATOS_PRIVACY_SHADE | grep . || echo hidden)
+  Browser:     $(b="$(envval POTATOS_BROWSER)"; b="${b:-chromium}"; echo "${b} ($(browser_bin "${b}" || echo "NOT INSTALLED"))")   (POTATOS_BROWSER=chromium|firefox$( [ "${POTATOS_PKG}" = apt ] && echo "|chrome|brave"))
 EOF
+}
+
+# One line about video encoding hardware. /dev/dri = a render node (VA-API /
+# NVENC on native Linux); /dev/dxg = WSL2 GPU paravirtualisation (NVENC only,
+# see docs/gpu-host.md); the Selkies log says which encoder actually loaded.
+gpu_line() {
+  local what=""
+  [ -e /dev/dri/renderD128 ] && what="render node /dev/dri/renderD128"
+  [ -e /dev/dxg ] && what="${what:+${what}, }/dev/dxg (WSL2 GPU-PV, NVENC encode only)"
+  if [ -n "${what}" ]; then
+    ldconfig -p 2>/dev/null | grep -q libnvidia-encode && what="${what}, libnvidia-encode found" || what="${what}, no libnvidia-encode"
+    echo "${what}"
+  else
+    echo "none (software encoding; the container log says 'Encoder: ...' per stream)"
+  fi
+}
+
+# potatos idle status|pause|resume  (talks to the potatos-idle service)
+# pause/resume only send a signal through sudo (a short-lived root process)
+# and wait with a bash builtin: re-executing the whole command under sudo, or
+# a `sleep` child, would be a process of user abc that the freeze stops, and
+# `potatos idle pause` would hang until the next thaw (the watcher also skips
+# processes named "potatos").
+cmd_idle() {
+  local svc=/run/service/svc-potatos-idle state=/run/potatos-idle/state
+  case "${1:-status}" in
+    status)
+      if [ -r "${state}" ]; then
+        # shellcheck disable=SC1090,SC2154
+        ( . "${state}"; printf 'desktop: %s (%s, since %s)\nviewer connected: %s\n' "${state}" "${reason}" "$(date -d "@${since}" '+%H:%M:%S' 2>/dev/null || echo "${since}")" "$([ "${clients}" = 1 ] && echo yes || echo no)" )
+      else
+        echo "desktop: idle watcher not running (POTATOS_IDLE_MINUTES=0?)"
+      fi
+      # shellcheck disable=SC2009
+      echo "frozen desktop processes: $(ps -u abc -o stat= 2>/dev/null | grep -c "^T")" ;;
+    pause|resume)
+      [ -d "${svc}" ] || { echo "potatos: idle watcher is not running" >&2; exit 1; }
+      [ -r "${state}" ] || { echo "potatos: idle watcher is disabled (POTATOS_IDLE_MINUTES=0)" >&2; exit 1; }
+      local sig=-2; [ "$1" = pause ] && sig=-1
+      if [ "$(id -u)" = 0 ]; then s6-svc "${sig}" "${svc}"; else sudo s6-svc "${sig}" "${svc}"; fi
+      read -r -t 2 <> <(:) || true; cmd_idle status ;;
+    *) echo "usage: potatos idle status|pause|resume" >&2; exit 2 ;;
+  esac
 }
 
 cmd_install() {
   [ $# -gt 0 ] || { echo "usage: potatos install <package>..." >&2; exit 2; }
-  echo "Installing with apk: $*"
+  echo "Installing with ${POTATOS_PKG}: $*"
   echo "(Packages live in the container, not /config. To keep them across"
   echo " re-deploys, add them to the POTATOS_EXTRA_PACKAGES variable.)"
-  sudo apk add --no-cache "$@"
+  pkg_install "$@"
 }
 
 cmd_search() {
   [ $# -gt 0 ] || { echo "usage: potatos search <term>" >&2; exit 2; }
-  apk --no-cache search -v "$@" 2>/dev/null | head -40
+  local out; out="$(pkg_search "$@" | head -40)"
+  if [ -n "${out}" ]; then echo "${out}"
+  else echo "no results$( [ "${POTATOS_PKG}" = apt ] && echo " (on the Debian image run 'sudo apt-get update' once first)")"; fi
+}
+
+# potatos install-browser chrome|brave   (Debian image only)
+# Adds the vendor's apt repository and installs the browser, then makes
+# POTATOS_BROWSER=chrome|brave work: a wrapper in /usr/local/bin that adds the
+# flags a container needs (same test as the base image's chromium wrapper)
+# and a .desktop override that uses it. Apt keys are stored ASCII-armored,
+# which apt >= 2.4 accepts in signed-by (no gpg dance). Nothing here is
+# persisted in /config: add the command to your Dockerfile or run it again
+# after a re-deploy.
+cmd_install_browser() {
+  local name="${1:-}" pkg desktop key list url bin
+  [ "${POTATOS_PKG}" = apt ] || { echo "potatos: install-browser needs the Debian image (Dockerfile.gpu)" >&2; exit 1; }
+  case "${name}" in
+    chrome) pkg=google-chrome-stable; desktop=google-chrome; bin=/usr/bin/google-chrome-stable
+            key=https://dl.google.com/linux/linux_signing_key.pub
+            url="https://dl.google.com/linux/chrome/deb/ stable main" ;;
+    brave)  pkg=brave-browser; desktop=brave-browser; bin=/usr/bin/brave-browser-stable   # what its .desktop file runs
+            key=https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+            url="https://brave-browser-apt-release.s3.brave.com/ stable main" ;;
+    *) echo "usage: potatos install-browser chrome|brave" >&2; exit 2 ;;
+  esac
+  list="/etc/apt/sources.list.d/potatos-${name}.list"
+  if [ ! -s "/usr/share/keyrings/potatos-${name}.key" ]; then
+    curl -fsSL --max-time 30 -o "/usr/share/keyrings/potatos-${name}.key" "${key}" \
+      || { echo "potatos: could not download the ${name} signing key (${key})" >&2; exit 1; }
+    printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/potatos-%s.key] %s\n' "${name}" "${url}" > "${list}"
+  fi
+  pkg_install "${pkg}" || { echo "potatos: apt could not install ${pkg}" >&2; rm -f "${list}"; exit 1; }
+  [ -x "${bin}" ] || bin="/usr/bin/${desktop}"     # older packages: no -stable name
+  # Container flags (no user namespaces unless privileged), as the base image
+  # does for Chromium, and the stale profile-lock cleanup of the chromium wrapper.
+  cat > "/usr/local/bin/${desktop}" <<EOF
+#!/bin/bash
+# PotatOS: ${name} with the flags a container needs (installed by 'potatos install-browser')
+. /usr/share/potatos/lib.sh && browser_unlock ${name}
+if grep -q 'Seccomp:.0' /proc/1/status; then exec ${bin} --password-store=basic "\$@"; fi
+exec ${bin} --password-store=basic --no-sandbox --test-type "\$@"
+EOF
+  chmod 755 "/usr/local/bin/${desktop}"
+  mkdir -p /usr/local/share/applications
+  # (anchored on both sides: brave-browser.desktop runs brave-browser-stable)
+  sed -E "s#^Exec=${bin}( |\$)#Exec=/usr/local/bin/${desktop}\\1#" "/usr/share/applications/${desktop}.desktop" > "/usr/local/share/applications/${desktop}.desktop"
+  echo "${name} installed. Set POTATOS_BROWSER=${name} (or pick it in Settings -> Default Applications)."
 }
 
 need_root() {
@@ -61,8 +158,7 @@ nginx_reload() {
 # Wait until boot has finished (nginx up), so we do not race init-nginx, which
 # rewrites the nginx config on every container start.
 wait_for_boot() {
-  local i
-  for i in $(seq 1 180); do
+  for _ in $(seq 1 180); do
     pgrep -x nginx >/dev/null 2>&1 && [ -s "${ENV_DIR}/POTATOS_HTTP_PORT" ] && return 0
     sleep 1
   done
@@ -110,7 +206,7 @@ cmd_allow_origin() {
   # 30-potatos-security re-applies this list.
   mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
   grep -qxF "${origin}" "${STATE_DIR}/allowed-origins" 2>/dev/null \
-    || printf '%s\n' "${origin}" >> "${STATE_DIR}/allowed-origins"
+    || { umask 077; printf '%s\n' "${origin}" >> "${STATE_DIR}/allowed-origins"; }
   echo "allowed origin: ${origin} (kept across restarts)"
   if [ -d /run/service/svc-selkies ]; then
     s6-svc -r /run/service/svc-selkies && echo "stream server restarted (reload the browser tab)"
@@ -129,6 +225,21 @@ cmd_codespaces_setup() {
   else
     echo "No POTATOS_PASSWORD secret: the desktop has no login. Keep port 3000 private."
   fi
+  # A PAT with the `codespace` scope lets the idle watcher stop the codespace
+  # (forwarded-port traffic does not count as activity for GitHub's own timeout).
+  # The codespace name is stored next to it: the watcher service may not see
+  # CODESPACE_NAME in its environment.
+  if [ -n "${POTATOS_GH_TOKEN:-}" ]; then
+    mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
+    ( umask 077; printf '%s' "${POTATOS_GH_TOKEN}" > "${STATE_DIR}/gh-token"
+      printf '%s' "${CODESPACE_NAME:-}" > "${STATE_DIR}/codespace-name" )
+    if [ -n "${CODESPACE_NAME:-}" ]; then
+      echo "POTATOS_GH_TOKEN stored: codespace ${CODESPACE_NAME} will be stopped after the idle timeout."
+      [ -d /run/service/svc-potatos-idle ] && s6-svc -r /run/service/svc-potatos-idle   # pick the name up now
+    else
+      echo "POTATOS_GH_TOKEN stored, but CODESPACE_NAME is empty: the codespace cannot be stopped automatically."
+    fi
+  fi
 }
 
 cmd_help() {
@@ -136,19 +247,24 @@ cmd_help() {
 potatos - PotatOS helper
 
   potatos info               show profile, streaming settings and resources
-  potatos install <pkg>...   install Alpine packages (apk), e.g. potatos install firefox
-  potatos search <term>      search Alpine packages
+  potatos install <pkg>...   install packages (${POTATOS_PKG}), e.g. potatos install gimp
+  potatos search <term>      search packages
+  potatos install-browser chrome|brave   (Debian/GPU image) add the vendor repo and install it
   potatos set-password [pw]  require a login (user abc); --off removes it
   potatos allow-origin <url> allow a web origin to open the stream (behind Host-rewriting proxies;
                              saved in /config/.potatos/allowed-origins)
-  potatos codespaces-setup   used by .devcontainer (origin + password from secrets)
+  potatos idle [status]      is the desktop frozen? (potatos-idle service)
+  potatos idle pause|resume  freeze / thaw the desktop now
+  potatos codespaces-setup   used by .devcontainer (origin, password and GitHub token from secrets)
   potatos help               this help
 EOF
 }
 
 case "${1:-help}" in
   info)    shift; cmd_info "$@" ;;
-  install) shift; cmd_install "$@" ;;
+  idle)    shift; cmd_idle "$@" ;;
+  install) need_root "$@"; shift; cmd_install "$@" ;;
+  install-browser) need_root "$@"; shift; cmd_install_browser "$@" ;;
   search)  shift; cmd_search "$@" ;;
   set-password)     need_root "$@"; shift; cmd_set_password "$@" ;;
   allow-origin)     need_root "$@"; shift; cmd_allow_origin "$@" ;;

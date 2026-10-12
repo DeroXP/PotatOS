@@ -1,0 +1,9 @@
+{
+  "name": "potatos-bench",
+  "private": true,
+  "description": "Reproducible CPU / fps / bandwidth measurements of a PotatOS container",
+  "type": "module",
+  "devDependencies": {
+    "playwright-core": "1.56.1"
+  }
+}

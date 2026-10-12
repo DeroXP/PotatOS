@@ -1,0 +1,14 @@
+#!/bin/bash
+# PotatOS: starts the chosen web browser (POTATOS_BROWSER=chromium|firefox,
+# plus chrome|brave on the Debian image). Used by the "Browser" desktop
+# launcher, so the launcher file never changes (potatos-session marks only
+# byte-identical stock launchers as trusted). Falls back to whichever browser
+# is installed.
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh
+want="$(cat /run/s6/container_environment/POTATOS_BROWSER 2>/dev/null || echo "${POTATOS_BROWSER:-chromium}")"
+for b in "${want}" chromium firefox chrome brave; do
+  if bin="$(browser_bin "${b}")"; then exec "${bin}" "$@"; fi
+done
+echo "potatos-browser: no web browser installed" >&2
+exit 1

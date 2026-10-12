@@ -21,9 +21,13 @@ services:
       - TZ=Etc/UTC                      # e.g. Europe/Berlin
       - PASSWORD=${PASSWORD:-}          # set to require a login (user: abc)
       - POTATOS_REQUIRE_PASSWORD=${POTATOS_REQUIRE_PASSWORD:-}  # true = generate one if PASSWORD is empty (see `docker compose logs`)
-      - POTATOS_PROFILE=${POTATOS_PROFILE:-balanced}   # potato | balanced | ultra | custom
+      - POTATOS_PROFILE=${POTATOS_PROFILE:-auto}   # auto (by vCPU) | potato | balanced | ultra | custom
       # - POTATOS_RESOLUTION=1920x1080  # lock the desktop size (default: follow the browser window)
-      # - POTATOS_EXTRA_PACKAGES=firefox gimp   # apk packages installed at every start
+      # - POTATOS_BROWSER=firefox       # default browser + "Browser" launcher (chromium | firefox)
+      # - POTATOS_IDLE_MINUTES=10       # freeze the desktop after N min without a viewer (0 = off)
+      # - POTATOS_QUIET_HOURS=01-07     # night mode: 1-min idle timeout, idle viewers frozen (TZ above)
+      # - POTATOS_HUD=off               # hide the stats overlay; POTATOS_ECO=off, POTATOS_PRIVACY_SHADE=off likewise
+      # - POTATOS_EXTRA_PACKAGES=gimp   # apk packages installed at every start
     volumes:
       - ./data:/config                  # home directory: files, settings, browser profile
     # Chromium and the video pipeline use shared memory; Docker's 64 MB default is too small.

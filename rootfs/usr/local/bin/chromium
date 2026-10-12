@@ -1,14 +1,41 @@
 #!/bin/bash
 # PotatOS: Chromium wrapper (shadows /usr/bin/chromium via PATH).
 #
-# Chromium keeps renderer memory in /dev/shm. Docker's default is only 64 MB
-# and some hosts (e.g. Railway) do not let you raise it, which makes tabs
-# crash ("Aw, Snap!"). If /dev/shm is small, tell Chromium to use /tmp instead.
-# The base image's /usr/bin/chromium handles --no-sandbox etc.
+# 1. Chromium keeps renderer memory in /dev/shm. Docker's default is only 64 MB
+#    and some hosts (e.g. Railway) do not let you raise it, which makes tabs
+#    crash ("Aw, Snap!"). If /dev/shm is small, tell Chromium to use /tmp instead.
+# 2. Stale profile lock. Chromium locks its profile with a SingletonLock
+#    symlink "<hostname>-<pid>". A new container (platform sleep/wake,
+#    redeploy, docker rm + run on the same volume) has a new host name, so
+#    Chromium refuses to start with "profile in use by another process on
+#    another computer" and the image has no dialog tool to unlock it. Remove
+#    the lock when its host is not ours or its pid is dead (browser_unlock).
+# 3. Session restore. When the last run did not end by the user closing the
+#    browser (platform sleep, docker kill, the idle freeze followed by a
+#    restart), Chromium's profile says exit_type "Crashed". Mark it "Normal"
+#    so it does not show the "didn't shut down correctly" bar, and reopen the
+#    last session's tabs with --restore-last-session (tested: tabs come back).
+#    "Chromium not running" is decided by the lock being absent or stale:
+#    `pgrep -x chromium` would match this very script.
+# The base image's own wrapper handles --no-sandbox etc.: /usr/bin/chromium on
+# Alpine, /usr/local/bin/wrapped-chromium on Debian (where /usr/bin/chromium
+# is Debian's plain launcher; Dockerfile.gpu points chromium.desktop here).
 
+BIN=/usr/bin/chromium
+[ -x /usr/local/bin/wrapped-chromium ] && BIN=/usr/local/bin/wrapped-chromium
 EXTRA=()
 shm_kb="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
 if [ -n "${shm_kb}" ] && [ "${shm_kb}" -lt 524288 ]; then
   EXTRA+=(--disable-dev-shm-usage)
 fi
-exec /usr/bin/chromium "${EXTRA[@]}" "$@"
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh      # browser_unlock
+browser_unlock chromium
+PREFS="${HOME}/.config/chromium/Default/Preferences"
+RESTORE=0
+[[ " $* " == *" --restore-last-session "* ]] && RESTORE=1   # potatos-session at login
+if grep -q '"exit_type":"Crashed"' "${PREFS}" 2>/dev/null && { [ "${RESTORE}" = 1 ] || [ ! -e "${HOME}/.config/chromium/SingletonLock" ]; }; then
+  sed -i 's/"exit_type":"Crashed"/"exit_type":"Normal"/' "${PREFS}"
+  [ "${RESTORE}" = 1 ] || EXTRA+=(--restore-last-session)
+fi
+exec "${BIN}" "${EXTRA[@]}" "$@"

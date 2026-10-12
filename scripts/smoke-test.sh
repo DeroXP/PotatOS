@@ -4,10 +4,13 @@
 #
 #   scripts/smoke-test.sh                 # build potatos:dev and test it
 #   SKIP_BUILD=1 scripts/smoke-test.sh    # test an existing image
+#   DOCKERFILE=Dockerfile.gpu IMAGE=potatos:gpu BUILD_ARGS='--build-arg POTATOS_APT_PACKAGES=' scripts/smoke-test.sh
+#                                         # the Debian/GPU variant (runs without a GPU: x264 path)
 #
 # Env:
 #   IMAGE        image tag to build/test            (default potatos:dev)
-#   BASE_PORT    first host port to use             (default 3300; uses BASE_PORT..+4)
+#   DOCKERFILE   Dockerfile to build                (default Dockerfile)
+#   BASE_PORT    first host port to use             (default 3300; uses BASE_PORT..+5)
 #   BUILD_ARGS   extra `docker build` arguments, e.g.
 #                BUILD_ARGS='--build-arg POTATOS_APK_PACKAGES=' for offline builds
 #   TIMEOUT      seconds to wait for "healthy"      (default 180)
@@ -25,7 +28,7 @@ say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL + 1)); }
 
-NAMES=(default port password railway overrides h264client)
+NAMES=(default port password railway overrides idle h264client)
 cleanup() { for n in "${NAMES[@]}"; do docker rm -fv "${PREFIX}-${n}" >/dev/null 2>&1 || true; done; }
 trap cleanup EXIT
 
@@ -77,16 +80,19 @@ run() { # run <suffix> <docker run args...>
 if [ -z "${SKIP_BUILD:-}" ]; then
   say "Building ${IMAGE}"
   # shellcheck disable=SC2086
-  docker build ${BUILD_ARGS:-} -t "${IMAGE}" "${ROOT}"
+  docker build ${BUILD_ARGS:-} -f "${ROOT}/${DOCKERFILE:-Dockerfile}" -t "${IMAGE}" "${ROOT}"
 fi
 
 say "Starting containers"
 run default  -p "${P}:3000" -p "$((P + 1)):3001"
-run port     -e PORT=8080 -e POTATOS_PROFILE=ultra -p "$((P + 2)):8080"
+run port     -e PORT=8080 -e POTATOS_PROFILE=ultra -e POTATOS_BROWSER=firefox -e POTATOS_HUD=off -e POTATOS_QUIET_HOURS=07-07 -p "$((P + 2)):8080"
 run password -e PASSWORD=smoke-pass -p "$((P + 3)):3000"
 run railway  -e RAILWAY_ENVIRONMENT=production -e POTATOS_PROFILE=potato -e SELKIES_FRAMERATE=45 -p "$((P + 4)):3000"
-run overrides -e POTATOS_PROFILE=potato -e SELKIES_MANUAL_RESOLUTION=false \
+run overrides -e POTATOS_PROFILE=potato -e SELKIES_MANUAL_RESOLUTION=false -e POTATOS_QUIET_HOURS=nonsense \
   -e SELKIES_ENCODER=h264enc,h265enc,vp8enc,vp9enc,av1enc,jpeg -e SELKIES_MICROPHONE_ENABLED=false -e NO_WEBCAM=1
+# Idle watcher with a 20 s timeout (instead of 10 min) and quiet hours configured;
+# a 2-CPU cgroup quota on a bigger host (what `docker --cpus` and PaaS plans do).
+run idle     --cpus=2 -e POTATOS_IDLE_SECONDS=20 -e POTATOS_QUIET_HOURS=01-07 -p "$((P + 5)):3000"
 
 say "Default container (http :${P}, https :$((P + 1)))"
 if wait_healthy "${PREFIX}-default"; then
@@ -95,9 +101,15 @@ if wait_healthy "${PREFIX}-default"; then
   expect "GET / over self-signed HTTPS" 200 -k "https://localhost:$((P + 1))/"
   # (capture first: `cmd | grep -q` can fail under pipefail when grep exits early)
   if grep -q '<title>PotatOS</title>' <<<"$(curl -s "http://localhost:${P}/")"; then ok "page title is PotatOS"; else bad "page title is not PotatOS"; fi
-  if grep -q "Profile 'balanced'" <<<"$(docker logs "${PREFIX}-default" 2>&1)"; then ok "balanced profile applied by default"; else bad "balanced profile not applied"; fi
+  if grep -q "Profile 'auto' on" <<<"$(docker logs "${PREFIX}-default" 2>&1)"; then ok "auto profile applied by default"; else bad "auto profile not applied"; fi
   if docker exec "${PREFIX}-default" test -f /config/Desktop/potatos-terminal.desktop; then ok "desktop launchers seeded"; else bad "desktop launchers missing"; fi
-  if grep -q 'Profile: *balanced' <<<"$(docker exec -u abc "${PREFIX}-default" potatos info)"; then ok "potatos CLI works"; else bad "potatos CLI failed"; fi
+  INFO="$(docker exec -u abc "${PREFIX}-default" potatos info)"
+  if grep -q 'Profile: *auto' <<<"${INFO}" && grep -q 'Eco mode: *on' <<<"${INFO}" && grep -q 'Browser: *chromium' <<<"${INFO}"; then ok "potatos CLI works (shows profile, eco, browser)"; else bad "potatos CLI output unexpected"; fi
+  if [ "$(selkies_eval "${PREFIX}-default" 's.video_streaming_mode')" = "(False, True)" ]; then ok "Turbo (video_streaming_mode) locked off"; else bad "Turbo not locked off"; fi
+  if grep -q 'window.POTATOS = {' <<<"$(curl -s "http://localhost:${P}/potatos-config.js")"; then ok "potatos-config.js generated at boot"; else bad "potatos-config.js missing"; fi
+  if grep -q 'src="./potatos.js"' <<<"$(curl -s "http://localhost:${P}/")"; then ok "potatos.js injected into the dashboard"; else bad "potatos.js not injected"; fi
+  expect "GET /potatos-paused.html" 200 "http://localhost:${P}/potatos-paused.html"
+  if docker exec "${PREFIX}-default" test -x /usr/local/bin/potatos-browser -a -f /config/Desktop/potatos-browser.desktop; then ok "Browser launcher + potatos-browser chooser present"; else bad "browser launcher missing"; fi
   # Cross-site WebSocket hijacking guard: only same-origin pages may stream.
   expect_ws "WebSocket from a foreign origin" 403 "https://evil.example" "http://localhost:${P}/api/websockets"
   expect_ws "WebSocket from the same origin" 101 "http://localhost:${P}" "http://localhost:${P}/api/websockets"
@@ -129,11 +141,16 @@ say "PORT remap (PORT=8080 -> host :$((P + 2)))"
 if wait_healthy "${PREFIX}-port"; then
   expect "GET / on remapped port" 200 "http://localhost:$((P + 2))/"
   expect "GET /healthz on remapped port" 200 "http://localhost:$((P + 2))/healthz"
-  if docker exec "${PREFIX}-port" grep -q 'listen 8080 default_server' /etc/nginx/http.d/default.conf; then ok "nginx config listens on 8080"; else bad "nginx config not remapped"; fi
+  # (nginx config: /etc/nginx/http.d/default.conf on Alpine, sites-available/default on Debian)
+  if grep -q 'listen 8080 default_server' <<<"$(docker exec "${PREFIX}-port" sh -c 'cat /etc/nginx/http.d/default.conf /etc/nginx/sites-available/default 2>/dev/null')"; then ok "nginx config listens on 8080"; else bad "nginx config not remapped"; fi
   # PaaS mode: only one public port, so Railway cannot pick the TLS one.
-  LISTEN="$(docker exec "${PREFIX}-port" netstat -tln 2>/dev/null | awk '/LISTEN/ {print $4}' | grep -E ':(3001|8080)$' | sort | tr '\n' ' ' || true)"
+  LISTEN="$(docker exec "${PREFIX}-port" sh -c 'netstat -tln 2>/dev/null || ss -tln' | awk '/LISTEN/ {print $4}' | grep -E ':(3001|8080)$' | sort | tr '\n' ' ' || true)"
   if [ "${LISTEN}" = "0.0.0.0:8080 127.0.0.1:3001 " ]; then ok "only PORT is public, HTTPS on 127.0.0.1 (${LISTEN% })"; else bad "unexpected listeners: ${LISTEN}"; fi
   if [ "$(selkies_eval "${PREFIX}-port" 's.use_css_scaling[0]')" = "True" ]; then ok "ultra keeps CSS scaling (no HiDPI 4K)"; else bad "ultra disables CSS scaling"; fi
+  if grep -qE 'x-scheme-handler/https=firefox(-esr)?\.desktop' <<<"$(docker exec "${PREFIX}-port" cat /config/.config/mimeapps.list)"; then ok "POTATOS_BROWSER=firefox seeded as default browser"; else bad "firefox not seeded as default browser"; fi
+  if grep -q 'Browser: *firefox' <<<"$(docker exec -u abc "${PREFIX}-port" potatos info)"; then ok "potatos info shows the firefox choice"; else bad "potatos info does not show firefox"; fi
+  if grep -q 'hud: "off"' <<<"$(curl -s "http://localhost:$((P + 2))/potatos-config.js")"; then ok "POTATOS_HUD=off reaches the client config"; else bad "POTATOS_HUD=off not in client config"; fi
+  if grep -q "ignoring POTATOS_QUIET_HOURS='07-07'" <<<"$(docker logs "${PREFIX}-port" 2>&1)"; then ok "quiet hours with start == end rejected"; else bad "POTATOS_QUIET_HOURS=07-07 accepted (would mean 'always')"; fi
 fi
 
 say "PASSWORD auth (host :$((P + 3)))"
@@ -143,6 +160,8 @@ if wait_healthy "${PREFIX}-password"; then
   expect "GET / with correct credentials" 200 -u abc:smoke-pass "http://localhost:$((P + 3))/"
   expect "GET /api websocket path without credentials" 401 "http://localhost:$((P + 3))/api"
   expect "GET /healthz stays open" 200 "http://localhost:$((P + 3))/healthz"
+  expect "GET /potatos-paused.html needs no login" 200 "http://localhost:$((P + 3))/potatos-paused.html"
+  expect "GET /potatos-waking.html needs no login" 200 "http://localhost:$((P + 3))/potatos-waking.html"
   # Basic auth is re-sent by browsers on cross-site WebSockets: the origin guard must still refuse.
   expect_ws "WebSocket from a foreign origin WITH credentials" 403 "https://evil.example" "http://localhost:$((P + 3))/api/websockets" -u abc:smoke-pass
 fi
@@ -167,6 +186,54 @@ if wait_healthy "${PREFIX}-overrides"; then
   if [ "${got}" = "h264enc,h265enc,vp8enc,vp9enc,av1enc,jpeg" ]; then ok "explicit SELKIES_ENCODER kept"; else bad "SELKIES_ENCODER replaced: ${got}"; fi
   got="$(selkies_eval "${PREFIX}-overrides" 's.microphone_enabled, c.on_demand("microphone"), s.webcam_enabled, c.on_demand("webcam")')"
   if [ "${got}" = "(False, True) False (False, True) False" ]; then ok "mic and webcam locked off, no on-demand capture"; else bad "mic/webcam still capturable: ${got}"; fi
+  if grep -q "ignoring POTATOS_QUIET_HOURS='nonsense'" <<<"$(docker logs "${PREFIX}-overrides" 2>&1)"; then ok "invalid POTATOS_QUIET_HOURS rejected"; else bad "invalid quiet hours not rejected"; fi
+fi
+
+say "Idle watcher: freeze after 20 s without a viewer (host :$((P + 5)))"
+if wait_healthy "${PREFIX}-idle"; then
+  IDLE="${PREFIX}-idle"
+  if grep -q 'quiet hours 01:00-07:00' <<<"$(docker logs "${IDLE}" 2>&1)"; then ok "quiet hours parsed"; else bad "quiet hours not parsed"; fi
+  if docker exec "${IDLE}" test -d /run/service/svc-potatos-idle; then ok "watcher runs as the s6-rc service svc-potatos-idle"; else bad "svc-potatos-idle service missing"; fi
+  # --cpus=2 is a cgroup quota: nproc still says 4 here, the profile must say 2.
+  if grep -q "Profile 'auto' on 2 vCPU" <<<"$(docker logs "${IDLE}" 2>&1)" && grep -q 'CPU: *2 vCPU' <<<"$(docker exec -u abc "${IDLE}" potatos info)"; then ok "auto profile and potatos info see the 2-CPU quota (nproc=$(docker exec "${IDLE}" nproc))"; else bad "cgroup CPU quota ignored by auto / potatos info"; fi
+  # Nothing touches the container now; the watcher must freeze within ~20 s + boot slack.
+  SUSPENDED=""
+  for _ in $(seq 1 45); do
+    SUSPENDED="$(docker logs "${IDLE}" 2>&1 | grep -o 'suspended: froze [0-9]* desktop processes' | tail -1 || true)"
+    [ -n "${SUSPENDED}" ] && break
+    sleep 2
+  done
+  if [ -n "${SUSPENDED}" ]; then ok "watcher ${SUSPENDED}"; else bad "watcher did not suspend"; docker logs --tail 10 "${IDLE}" 2>&1 | sed 's/^/    | /'; fi
+  STOPPED="$(docker exec "${IDLE}" sh -c 'ps -u abc -o stat= | grep -c "^T"' || true)"
+  if [ "${STOPPED:-0}" -ge 10 ]; then ok "${STOPPED} desktop processes in state T (stopped)"; else bad "only ${STOPPED} stopped processes"; fi
+  if grep -q 'desktop: frozen' <<<"$(docker exec "${IDLE}" potatos idle status)"; then ok "potatos idle status reports frozen"; else bad "potatos idle status wrong"; fi
+  # Railway Serverless sleeps a service that sends no packets: eth0 tx must not move for 30 s.
+  TX="$(docker exec "${IDLE}" sh -c 'a=$(awk "/eth0/ {print \$11}" /proc/net/dev); sleep 30; b=$(awk "/eth0/ {print \$11}" /proc/net/dev); echo "$a $b"')"
+  if [ "${TX%% *}" = "${TX##* }" ]; then ok "0 outbound packets on eth0 in 30 s while frozen (${TX%% *} -> ${TX##* })"; else bad "outbound packets while frozen: ${TX}"; fi
+  expect "GET / while frozen" 200 "http://localhost:$((P + 5))/"
+  RESUMED=""
+  for _ in $(seq 1 10); do
+    RESUMED="$(docker logs "${IDLE}" 2>&1 | grep -o 'resumed [0-9]* desktop processes (page requested)' | tail -1 || true)"
+    [ -n "${RESUMED}" ] && break
+    sleep 1
+  done
+  if [ -n "${RESUMED}" ]; then ok "page request thaws the desktop (${RESUMED})"; else bad "desktop not thawed by a page request"; fi
+  # pause/resume as the desktop user (must not hang: the CLI only sudo's the signal)
+  if grep -q 'desktop: frozen' <<<"$(timeout 20 docker exec -u abc "${IDLE}" potatos idle pause)"; then ok "potatos idle pause (as abc) freezes"; else bad "potatos idle pause failed or hung"; fi
+  # A 404 (or a scanner's 401) must not wake a frozen desktop; a real page load must.
+  expect "GET /nope while frozen" 404 "http://localhost:$((P + 5))/nope"
+  sleep 4
+  if grep -q 'desktop: frozen' <<<"$(docker exec "${IDLE}" potatos idle status)"; then ok "a 404 does not thaw the desktop"; else bad "a 404 thawed the desktop"; fi
+  if grep -q 'desktop: active' <<<"$(timeout 20 docker exec -u abc "${IDLE}" potatos idle resume)"; then ok "potatos idle resume (as abc) thaws"; else bad "potatos idle resume failed"; fi
+  if ! grep -qE 'environ: Permission denied|HTTP 000000' <<<"$(docker logs "${IDLE}" 2>&1)"; then ok "no shell error noise in the watcher log"; else bad "watcher log has error noise (environ / HTTP 000000)"; fi
+  # Waking page: with the streaming server down, nginx answers every page with it.
+  docker exec "${IDLE}" s6-svc -d /run/service/svc-selkies
+  sleep 2
+  if grep -q '<title>PotatOS (waking up)</title>' <<<"$(curl -s "http://localhost:$((P + 5))/")"; then ok "waking page served while selkies is down"; else bad "no waking page while selkies is down"; fi
+  expect "GET /api/sessions while selkies is down" 502 "http://localhost:$((P + 5))/api/sessions"
+  docker exec "${IDLE}" s6-svc -u /run/service/svc-selkies
+  sleep 5
+  expect "GET / after selkies is back" 200 "http://localhost:$((P + 5))/"
 fi
 
 say "Result: ${PASS} passed, ${FAIL} failed"

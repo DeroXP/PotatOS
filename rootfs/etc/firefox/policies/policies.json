@@ -1,0 +1,14 @@
+{
+  "__comment": "PotatOS: Firefox reopens its last session on every start (browser.startup.page=3). After a hard stop (platform sleep, docker stop) Firefox normally shows a 'restore session?' page; max_resumed_crashes=-1 makes it restore right away. Users can still change these in about:preferences (Status: default).",
+  "policies": {
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "DisableAppUpdate": true,
+    "Preferences": {
+      "browser.startup.page": { "Value": 3, "Status": "default" },
+      "browser.sessionstore.resume_from_crash": { "Value": true, "Status": "default" },
+      "browser.sessionstore.max_resumed_crashes": { "Value": -1, "Status": "default" },
+      "browser.shell.checkDefaultBrowser": { "Value": false, "Status": "default" }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+/* PotatOS overlays (see potatos.js). Everything is pointer-events:none except
+   the privacy shade and the HUD's toggle tab. */
+#potatos-hud, #potatos-hud-tab, #potatos-countdown, #potatos-shade, #potatos-waking {
+  position: fixed; z-index: 2147483000; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  color: #fff; box-sizing: border-box;
+}
+#potatos-hud { pointer-events: none; background: rgba(0, 0, 0, .55); padding: 2px 8px; border-radius: 4px; white-space: pre; margin: 4px 14px; }
+#potatos-hud-tab { width: 10px; height: 10px; margin: 4px; border-radius: 2px; background: #e0a526; opacity: .6; cursor: pointer; }
+#potatos-hud-tab:hover { opacity: 1; }
+.potatos-top-right { top: 0; right: 0; }
+.potatos-top-left { top: 0; left: 0; }
+.potatos-bottom-right { bottom: 0; right: 0; }
+.potatos-bottom-left { bottom: 0; left: 0; }
+#potatos-hud.potatos-top-left, #potatos-hud.potatos-bottom-left { margin: 4px 4px 4px 18px; }
+#potatos-countdown { pointer-events: none; left: 50%; top: 12px; transform: translateX(-50%); font-size: 15px;
+  background: rgba(224, 165, 38, .95); color: #111; padding: 8px 16px; border-radius: 8px; }
+#potatos-waking { pointer-events: none; inset: 0; display: grid; place-items: center; font: 18px system-ui, sans-serif;
+  background: #1b1b1f; }
+/* after wakingSeconds without a stream: a hint at the top, the page below stays usable */
+#potatos-waking.potatos-waking-late { inset: 12px auto auto 50%; transform: translateX(-50%); max-width: 90vw;
+  font-size: 14px; padding: 8px 16px; border-radius: 8px; background: rgba(27, 27, 31, .9); text-align: center; }
+#potatos-shade { inset: 0; display: grid; place-items: center; font: 16px system-ui, sans-serif; cursor: pointer;
+  background: rgba(0, 0, 0, .35); text-shadow: 0 1px 4px #000; }
+body.potatos-shaded #videoCanvas, body.potatos-shaded #videoStream { filter: blur(18px); }

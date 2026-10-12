@@ -1,0 +1,12 @@
+# A/B on "anim" (Chromium CSS animation, 40% x 50% of a 1080p screen, constant 60 Hz damage), --cpus 4
+# ./run-matrix.sh matrix-example.txt 2 results.jsonl && node summarize.mjs results.jsonl --base anim-base
+anim-base       --cpus 4 --profile balanced --viewport 1920x1080 --workload anim
+anim-crf25      --cpus 4 --profile balanced --viewport 1920x1080 --workload anim --env SELKIES_VIDEO_CRF=25,5-50
+anim-cbr        --cpus 4 --profile balanced --viewport 1920x1080 --workload anim --env SELKIES_RATE_CONTROL_MODE=cbr
+anim-fps30      --cpus 4 --profile balanced --viewport 1920x1080 --workload anim --env SELKIES_FRAMERATE=30,8-120
+anim-striped    --cpus 4 --profile balanced --viewport 1920x1080 --workload anim --env SELKIES_ENCODER=h264enc-striped
+anim-720        --cpus 4 --profile balanced --viewport 1280x720 --workload anim
+anim-c2         --cpus 2 --profile balanced --viewport 1920x1080 --workload anim
+idle-noclient   --cpus 2 --viewport none --workload none
+idle-visible    --cpus 2 --viewport 1920x1080 --workload static
+idle-hidden     --cpus 2 --viewport 1920x1080 --workload static --hidden

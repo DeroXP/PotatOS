@@ -1,0 +1,72 @@
+# PotatOS GPU variant - the same desktop on Debian, for hosts with an NVIDIA GPU.
+#
+# NVIDIA's driver libraries are glibc-only, so the Alpine image (Dockerfile)
+# can never use NVENC. This variant is FROM linuxserver/webtop:debian-xfce
+# (Debian 13, same Selkies/pixelflux stack, glibc build) and reuses the whole
+# rootfs/ overlay: /usr/share/potatos/lib.sh hides the differences (apt vs apk,
+# nginx config path, browser binary names). See docs/gpu-host.md for the
+# Windows 11 + Docker Desktop (WSL2) setup and docker-compose.gpu.yml.
+#
+#   docker build -f Dockerfile.gpu -t potatos:gpu .
+#   docker build -f Dockerfile.gpu --build-arg POTATOS_APT_PACKAGES= -t potatos:gpu .   # offline
+ARG BASE_IMAGE=linuxserver/webtop:debian-xfce
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="PotatOS (GPU / Debian)" \
+      org.opencontainers.image.description="Lightweight Linux desktop (XFCE) streamed to any web browser, NVENC-capable" \
+      org.opencontainers.image.licenses="MIT"
+
+# Same defaults as the Alpine image (see Dockerfile). ultra is the profile the
+# GPU host is for; 'auto' would pick by CPU count. NVIDIA_DRIVER_CAPABILITIES
+# is already "all" in the base image.
+ENV TITLE=PotatOS \
+    SELKIES_UI_TITLE=PotatOS \
+    POTATOS_PROFILE=auto \
+    POTATOS_BROWSER=chromium \
+    POTATOS_IDLE_MINUTES=10 \
+    START_DOCKER=false \
+    TZ=Etc/UTC
+
+# Debian packages on top of the base image (chromium, xfce4-terminal, thunar,
+# mousepad, ristretto, xarchiver, pavucontrol, xfce4-taskmanager are already
+# there). firefox-esr is Debian's Firefox: it is linked to /usr/local/bin/firefox
+# so POTATOS_BROWSER=firefox and the scripts work the same as on Alpine, and
+# the PotatOS Firefox policy (session restore) is installed where ESR reads it.
+# Chrome / Brave: `potatos install-browser chrome|brave` inside the desktop.
+# Override with --build-arg POTATOS_APT_PACKAGES="..." (empty = add nothing).
+ARG POTATOS_APT_PACKAGES="htop mpv galculator firefox-esr"
+RUN if [ -n "${POTATOS_APT_PACKAGES}" ]; then \
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${POTATOS_APT_PACKAGES}; \
+    fi \
+ && if command -v firefox-esr >/dev/null && ! command -v firefox >/dev/null; then ln -s "$(command -v firefox-esr)" /usr/local/bin/firefox; fi \
+ && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+
+# Streaming defaults: identical to the Alpine image (see the comments there).
+ENV SELKIES_ALLOWED_ORIGINS= \
+    SELKIES_ENCODER= \
+    SELKIES_VIDEO_STREAMING_MODE="false|locked"
+
+# The PotatOS overlay (identical to the Alpine image) plus the Debian bits:
+#   - chromium.desktop in the base image starts /usr/local/bin/wrapped-chromium
+#     directly; route it through the PotatOS wrapper (shm fallback, session
+#     restore), which calls wrapped-chromium itself on Debian.
+#   - Firefox ESR policies: Debian's ESR reads /etc/firefox-esr/policies and
+#     its distribution/ directory, not only /etc/firefox/policies.
+COPY rootfs/ /
+RUN chmod 755 /custom-cont-init.d/* /etc/s6-overlay/s6-rc.d/svc-potatos-idle/run /usr/local/bin/potatos* /usr/local/bin/chromium \
+ && chmod 644 /usr/share/potatos/launchers/*.desktop /etc/xdg/autostart/potatos-session.desktop \
+      /etc/firefox/policies/policies.json /usr/share/selkies/selkies-dashboard/potatos* \
+ && sed -i 's#^Exec=/usr/local/bin/wrapped-chromium#Exec=/usr/local/bin/chromium#' /usr/share/applications/chromium.desktop \
+ && mkdir -p /etc/firefox-esr/policies \
+ && cp /etc/firefox/policies/policies.json /etc/firefox-esr/policies/policies.json \
+ && if [ -d /usr/lib/firefox-esr ]; then mkdir -p /usr/lib/firefox-esr/distribution && cp /etc/firefox/policies/policies.json /usr/lib/firefox-esr/distribution/policies.json; fi \
+ && for d in /usr/share/selkies/selkies-dashboard*/; do \
+      cp -n /usr/share/selkies/selkies-dashboard/potatos* "$d" 2>/dev/null || true; \
+      sed -i -e 's#<title>Selkies</title>#<title>PotatOS</title>#' \
+             -e 's#</head>#<link rel="stylesheet" href="./potatos.css"><script src="./potatos-config.js"></script><script src="./potatos.js" defer></script></head>#' "$d/index.html"; \
+    done
+
+EXPOSE 3000 3001
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["/usr/local/bin/potatos-healthcheck"]

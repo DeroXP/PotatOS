@@ -3,19 +3,72 @@
 #
 # PotatOS: first-boot desktop setup for user abc (HOME=/config).
 #
-# Runs once per /config volume (marker file below), so anything the user
-# changes or deletes afterwards stays that way. Never overwrites existing files.
+# Every boot:
+#   - default web browser (POTATOS_BROWSER=chromium|firefox): seeded into
+#     mimeapps.list + XFCE helpers.rc only when unset or when POTATOS_BROWSER
+#     changed since the last boot, so a choice the user makes inside the
+#     desktop is kept.
+#   - session restore: xfce4-session names its saved session after the host
+#     name, which changes with every Railway deploy / new container. Copy the
+#     newest saved session to the current name so it is restored.
+# Once per /config volume (marker file below), so anything the user changes
+# or deletes afterwards stays that way. Never overwrites existing files:
 #   - Desktop launchers: Browser, Terminal, Files, Text Editor, Task Manager
-#   - Chromium as the preferred web browser for XFCE
-# The PotatOS wallpaper is set via /defaults/xfce (rootfs/defaults/xfce/xfce4-desktop.xml),
-# which the base image copies only when the user has no XFCE config yet.
+# The PotatOS wallpaper and session settings come from /defaults/xfce
+# (rootfs/defaults/xfce/*.xml), which the base image copies only when the
+# user has no XFCE config yet.
 
 HOME_DIR="${HOME:-/config}"
 DESKTOP_DIR="${FILE_MANAGER_PATH:-${HOME_DIR}/Desktop}"
 MARKER="${HOME_DIR}/.potatos/desktop-seeded-v1"
 LAUNCHERS=/usr/share/potatos/launchers
+ENV_DIR=/run/s6/container_environment
 
 mkdir -p "${HOME_DIR}/.potatos"
+
+# --- default browser ---------------------------------------------------------
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh        # browser_bin / browser_desktop / browser_helper
+BROWSER="${POTATOS_BROWSER:-chromium}"; BROWSER="${BROWSER,,}"
+case "${BROWSER}" in
+  chromium|firefox) ;;
+  chrome|brave) [ "${POTATOS_PKG}" = apt ] || { echo "[potatos] WARNING: POTATOS_BROWSER=${BROWSER} needs the Debian image (Dockerfile.gpu), using chromium"; BROWSER=chromium; } ;;
+  *) echo "[potatos] WARNING: POTATOS_BROWSER='${BROWSER}' unknown, using chromium"; BROWSER=chromium ;;
+esac
+if ! browser_bin "${BROWSER}" >/dev/null; then
+  echo "[potatos] WARNING: ${BROWSER} is not installed (POTATOS_APK_PACKAGES / POTATOS_APT_PACKAGES, POTATOS_EXTRA_PACKAGES, or 'potatos install-browser'); the Browser launcher falls back to what is there"
+fi
+printf '%s' "${BROWSER}" > "${ENV_DIR}/POTATOS_BROWSER"
+BROWSER_MARKER="${HOME_DIR}/.potatos/browser"
+MIMEAPPS="${HOME_DIR}/.config/mimeapps.list"
+HELPERS="${HOME_DIR}/.config/xfce4/helpers.rc"
+if [ "$(cat "${BROWSER_MARKER}" 2>/dev/null)" != "${BROWSER}" ]; then
+  DESKTOP_ID="$(browser_desktop "${BROWSER}")"
+  echo "[potatos] Default web browser: ${BROWSER} (${DESKTOP_ID})"
+  mkdir -p "${HOME_DIR}/.config/xfce4"
+  # xdg-open / Thunar: mimeapps.list (replace our previous entries, keep the rest)
+  [ -f "${MIMEAPPS}" ] || printf '[Default Applications]\n' > "${MIMEAPPS}"
+  sed -i -E '/^(x-scheme-handler\/(http|https)|text\/html|application\/xhtml\+xml)=(chromium|firefox|firefox-esr|google-chrome|brave-browser)\.desktop$/d' "${MIMEAPPS}"
+  sed -i "s#^\[Default Applications\]#[Default Applications]\nx-scheme-handler/http=${DESKTOP_ID}\nx-scheme-handler/https=${DESKTOP_ID}\ntext/html=${DESKTOP_ID}\napplication/xhtml+xml=${DESKTOP_ID}#" "${MIMEAPPS}"
+  # exo-open / XFCE "Web Browser" entries: helpers.rc
+  if [ -f "${HELPERS}" ]; then sed -i '/^WebBrowser=/d' "${HELPERS}"; fi
+  printf 'WebBrowser=%s\n' "$(browser_helper "${BROWSER}")" >> "${HELPERS}"
+  grep -q '^TerminalEmulator=' "${HELPERS}" || printf 'TerminalEmulator=xfce4-terminal\nFileManager=thunar\n' >> "${HELPERS}"
+  chown -R abc:abc "${HOME_DIR}/.config/xfce4" "${MIMEAPPS}"
+  printf '%s' "${BROWSER}" > "${BROWSER_MARKER}"
+fi
+
+# --- session restore across host names ---------------------------------------
+SESSIONS="${HOME_DIR}/.cache/sessions"
+CUR="${SESSIONS}/xfce4-session-$(hostname):1"
+if [ -d "${SESSIONS}" ] && [ ! -e "${CUR}" ]; then
+  # shellcheck disable=SC2012
+  NEWEST="$(ls -t "${SESSIONS}"/xfce4-session-*:1 2>/dev/null | head -1)"
+  if [ -n "${NEWEST}" ]; then
+    cp -p "${NEWEST}" "${CUR}" && chown abc:abc "${CUR}"
+    echo "[potatos] Session restore: using the session saved as $(basename "${NEWEST}")"
+  fi
+fi
 
 if [ -f "${MARKER}" ]; then
   echo "[potatos] Desktop already set up on this volume, leaving it alone"
@@ -38,13 +91,5 @@ if [ -d /workspaces ] && [ ! -e "${DESKTOP_DIR}/workspaces" ]; then
   ln -s /workspaces "${DESKTOP_DIR}/workspaces"
 fi
 chown -R abc:abc "${DESKTOP_DIR}"
-
-# Preferred applications (used by exo-open / "Web Browser" menu entries).
-HELPERS="${HOME_DIR}/.config/xfce4/helpers.rc"
-if [ ! -f "${HELPERS}" ]; then
-  mkdir -p "$(dirname "${HELPERS}")"
-  printf 'WebBrowser=chromium\nTerminalEmulator=xfce4-terminal\nFileManager=thunar\n' > "${HELPERS}"
-  chown -R abc:abc "${HOME_DIR}/.config/xfce4"
-fi
 
 touch "${MARKER}"

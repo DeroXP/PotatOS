@@ -1,8 +1,12 @@
 #!/bin/sh
 # PotatOS: Docker HEALTHCHECK. Healthy = nginx answers /healthz AND the
-# Selkies streaming server is running.
+# Selkies streaming server answers its own /api/health (until it does, nginx
+# serves the "waking up" page instead of the desktop). The Selkies probe uses
+# source ports 65000-65010 so the potatos-idle watcher can tell it from a
+# viewer's WebSocket (both are loopback connections to the same port).
 PORT="$(cat /run/s6/container_environment/POTATOS_HTTP_PORT 2>/dev/null)"
 PORT="${PORT:-${CUSTOM_PORT:-3000}}"
 curl -fsS -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/healthz" || exit 1
-pgrep -f 'bin/selkies' >/dev/null || exit 1
+# (Selkies serves its API under SUBFOLDER too, e.g. /desk/api/health)
+curl -fsS -o /dev/null --max-time 4 --local-port 65000-65010 "http://127.0.0.1:${CUSTOM_WS_PORT:-8082}${SUBFOLDER:-/}api/health" || exit 1
 exit 0

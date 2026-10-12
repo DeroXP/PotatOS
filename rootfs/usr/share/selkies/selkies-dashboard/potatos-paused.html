@@ -1,0 +1,36 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PotatOS (paused)</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#1b1b1f;color:#eee;font:16px system-ui,sans-serif;text-align:center}
+button{font:inherit;padding:.8em 1.6em;border-radius:8px;border:0;background:#e0a526;color:#111;cursor:pointer}p{color:#bbb}</style></head>
+<body><main><h1>PotatOS is paused</h1><p id="why"></p><button id="r">Resume</button><p id="st"></p>
+<script>
+// Static page, no connection: a tab parked here does not keep the server awake.
+// Resume = probe the server (wakes a sleeping Railway service), then go back.
+// This page is served without a login, so `back` is only followed when it is
+// a path on this very origin (no "//evil" or "/\evil" open redirects).
+const q = new URLSearchParams(location.hash.slice(1));
+const reason = q.get('reason') || 'hidden';
+let back = './';
+try { const u = new URL(q.get('back') || './', location.href); if (u.origin === location.origin && !/^\/[\/\\]/.test(q.get('back') || '')) back = u.pathname + u.search; } catch {}
+document.getElementById('why').textContent = {
+  hidden: 'This tab was in the background, so it let go of the desktop. Your apps keep running.',
+  idle: 'Nothing happened for a while, so this tab let go of the desktop. Your apps keep running.',
+  quiet: 'Quiet hours: this tab let go of the desktop. Your apps keep running.',
+}[reason] || '';
+const st = document.getElementById('st');
+let going = false;
+async function go() {
+  if (going) return; going = true;
+  if (reason === 'hidden') sessionStorage.setItem('potatos.shade', '1');
+  // (relative, so a SUBFOLDER install probes <subfolder>api/health; a 401/403
+  //  means the server is up and wants the login again: go back and let it ask)
+  for (let i = 1; ; i++) {
+    try { const r = await fetch(new URL('api/health', location.href), { cache: 'no-store' }); if (r.ok || r.status === 401 || r.status === 403) break; } catch {}
+    st.textContent = 'Waking the desktop up… (' + i + ')';
+    await new Promise((res) => setTimeout(res, 3000));
+  }
+  location.replace(back);
+}
+document.getElementById('r').onclick = go;
+if (reason === 'hidden') document.addEventListener('visibilitychange', () => { if (!document.hidden) go(); });
+</script></main></body></html>

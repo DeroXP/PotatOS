@@ -1,0 +1,64 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: web client settings -> /usr/share/selkies/web/potatos-config.js
+#
+# The Dockerfile injects <script src="./potatos-config.js"> + potatos.js into
+# the Selkies dashboard. init-nginx wipes and recopies the dashboard directory
+# to /usr/share/selkies/web on every boot (before this script runs), so the
+# build-time files survive and this generated file has to be written each boot.
+# Everything below can be changed with environment variables, no rebuild:
+#
+#   POTATOS_HUD=on|off                 POTATOS_HUD_CORNER=bottom-right (default: the XFCE panel clock sits top-right)|top-right|top-left|bottom-left
+#   POTATOS_ECO=on|off                 POTATOS_ECO_SECONDS=30 (target fps > 60 only; drops to 60)
+#   POTATOS_HIDDEN_TAB_MINUTES=10      hidden tab -> paused page (0 = never)
+#   POTATOS_TAB_IDLE_MINUTES=30        visible tab, no input, static screen -> countdown + paused page (0 = never)
+#   POTATOS_PRIVACY_SHADE=off|hidden|focus
+#   POTATOS_QUIET_HOURS="01-07"        (also read by the potatos-idle service)
+
+WEB=/usr/share/selkies/web
+ENV_DIR=/run/s6/container_environment
+[ -d "${WEB}" ] || { echo "[potatos] WARNING: ${WEB} missing, no potatos-config.js"; exit 0; }
+
+onoff() { case "${1,,}" in off|false|0|no) echo off ;; *) echo on ;; esac; }
+num()   { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] && echo "$1" || echo "$2"; }
+jsstr() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
+
+HUD="$(onoff "${POTATOS_HUD:-on}")"
+CORNER="${POTATOS_HUD_CORNER:-bottom-right}"
+case "${CORNER}" in top-right|top-left|bottom-right|bottom-left) ;; *) CORNER=bottom-right ;; esac
+ECO="$(onoff "${POTATOS_ECO:-on}")"
+SHADE="${POTATOS_PRIVACY_SHADE:-hidden}"; SHADE="${SHADE,,}"
+case "${SHADE}" in off|hidden|focus) ;; *) echo "[potatos] WARNING: POTATOS_PRIVACY_SHADE='${SHADE}' unknown, using 'hidden'"; SHADE=hidden ;; esac
+# Same rule as the potatos-idle service: HH-HH, both <= 24, different hours
+# (07-07 would otherwise read as "always"); anything else is dropped here too.
+QUIET="${POTATOS_QUIET_HOURS:-}"
+if [ -n "${QUIET}" ]; then
+  if [[ "${QUIET}" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]] && [ "${BASH_REMATCH[1]}" -le 24 ] && [ "${BASH_REMATCH[2]}" -le 24 ] \
+     && [ $((10#${BASH_REMATCH[1]} % 24)) -ne $((10#${BASH_REMATCH[2]} % 24)) ]; then
+    QUIET="$(printf '%02d-%02d' $((10#${BASH_REMATCH[1]} % 24)) $((10#${BASH_REMATCH[2]} % 24)))"
+  else
+    QUIET=""
+  fi
+fi
+
+cat > "${WEB}/potatos-config.js" <<EOF
+// generated at boot by /custom-cont-init.d/50-potatos-web (do not edit)
+window.POTATOS = {
+  hud: "${HUD}", hudCorner: "${CORNER}",
+  eco: $([ "${ECO}" = on ] && echo true || echo false), ecoSeconds: $(num "${POTATOS_ECO_SECONDS:-30}" 30), ecoFps: 60,
+  hiddenMinutes: $(num "${POTATOS_HIDDEN_TAB_MINUTES:-10}" 10), tabIdleMinutes: $(num "${POTATOS_TAB_IDLE_MINUTES:-30}" 30),
+  shade: "${SHADE}", quietHours: "${QUIET}", quietInputMinutes: $(num "${POTATOS_QUIET_INPUT_MINUTES:-5}" 5), tz: $(jsstr "${TZ:-Etc/UTC}"),
+  idleMinutes: $(num "${POTATOS_IDLE_MINUTES:-10}" 10), profile: $(jsstr "$(cat "${ENV_DIR}/POTATOS_PROFILE" 2>/dev/null)")
+};
+EOF
+chmod 644 "${WEB}/potatos-config.js"
+# The waking page is served in place of ANY failing path, so it cannot use a
+# relative URL for its /api/health probe: give it the SUBFOLDER as data-base.
+SF="${SUBFOLDER:-/}"
+[ -f "${WEB}/potatos-waking.html" ] && sed -i "s#<html lang=\"en\" data-base=\"[^\"]*\">#<html lang=\"en\" data-base=\"${SF}\">#" "${WEB}/potatos-waking.html"
+# Remember the effective values for `potatos info`.
+printf '%s' "${HUD}" > "${ENV_DIR}/POTATOS_HUD"
+printf '%s' "${ECO}" > "${ENV_DIR}/POTATOS_ECO"
+printf '%s' "${SHADE}" > "${ENV_DIR}/POTATOS_PRIVACY_SHADE"
+echo "[potatos] Web client: HUD ${HUD} (${CORNER}), eco mode ${ECO}, privacy shade ${SHADE}, hidden tab ${POTATOS_HIDDEN_TAB_MINUTES:-10} min, idle tab ${POTATOS_TAB_IDLE_MINUTES:-30} min${QUIET:+, quiet hours ${QUIET}}"

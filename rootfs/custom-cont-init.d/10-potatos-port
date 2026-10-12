@@ -4,7 +4,9 @@
 # PotatOS: HTTP port + health endpoint.
 #
 # Boot order in the base image (s6-rc):
-#   init-nginx (writes /etc/nginx/http.d/default.conf from CUSTOM_PORT etc.)
+#   init-nginx (writes the nginx config from CUSTOM_PORT etc.: on Alpine
+#   /etc/nginx/http.d/default.conf, on Debian /etc/nginx/sites-available/default;
+#   same contents, lib.sh finds it)
 #     -> ... -> init-custom-files (runs THIS directory) -> svc-nginx (starts nginx)
 # So by the time we run, the config exists but nginx is not running yet:
 # editing the file here is enough, no reload needed.
@@ -14,10 +16,11 @@
 # 2. Add an unauthenticated `GET /healthz` so health checks keep working when
 #    a PASSWORD (basic auth) is enabled.
 
-NGINX_CONFIG=/etc/nginx/http.d/default.conf
+# shellcheck source=rootfs/usr/share/potatos/lib.sh
+. /usr/share/potatos/lib.sh
 
-if [ ! -f "${NGINX_CONFIG}" ]; then
-  echo "[potatos] WARNING: ${NGINX_CONFIG} not found, skipping port setup"
+if [ -z "${NGINX_CONFIG}" ]; then
+  echo "[potatos] WARNING: nginx config not found, skipping port setup"
   exit 0
 fi
 
@@ -60,4 +63,22 @@ printf '%s' "${CURRENT_PORT}" > /run/s6/container_environment/POTATOS_HTTP_PORT
 # image regenerates the config on each boot, but guard anyway).
 if ! grep -q 'location = /healthz' "${NGINX_CONFIG}"; then
   sed -i 's#^server {$#server {\n  location = /healthz { auth_basic off; access_log off; default_type text/plain; return 200 "ok"; }#' "${NGINX_CONFIG}"
+fi
+
+# Waking page. While the streaming server is still starting (container boot,
+# Railway Serverless wake-up), nginx answers 502 on /api/*, and the dashboard's
+# static files would load into a grey screen. So: `auth_request` makes every
+# page load check /api/health first (a 2 ms loopback subrequest), and any
+# 5xx becomes the branded auto-refreshing /potatos-waking.html. The paused
+# page (see potatos.js) and the waking page need no login, so a parked tab
+# can come back without a credentials prompt.
+# (No '#' in the lines below: init-nginx strips all of them when PASSWORD is set.)
+SF="${SUBFOLDER:-/}"
+WEB=/usr/share/selkies/web
+if ! grep -q 'potatos-waking' "${NGINX_CONFIG}"; then
+  sed -i -E \
+    -e "s#^  error_page 500 502 503 504 /50x.html;#  error_page 500 502 503 504 ${SF}potatos-waking.html;#" \
+    -e "s#^  location ${SF} \{\$#  location ${SF} {\n    auth_request ${SF}potatos-up;#" \
+    -e "s#^server \{\$#server {\n  location = ${SF}potatos-up { internal; proxy_pass http://127.0.0.1:${CUSTOM_WS_PORT:-8082}${SF}api/health; proxy_connect_timeout 2s; proxy_read_timeout 2s; }\n  location = ${SF}potatos-waking.html { auth_basic off; auth_request off; alias ${WEB}/potatos-waking.html; }\n  location = ${SF}potatos-paused.html { auth_basic off; auth_request off; alias ${WEB}/potatos-paused.html; }#" \
+    "${NGINX_CONFIG}"
 fi

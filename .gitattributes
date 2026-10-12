@@ -1,0 +1,8 @@
+# Every text file is checked out with LF line endings, also on Windows where
+# Git defaults to CRLF: the shell scripts in rootfs/ are copied into the image
+# as they are, and a "#!/usr/bin/with-contenv bash\r" shebang does not run
+# (the GPU host build on Docker Desktop would boot without any PotatOS setup).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

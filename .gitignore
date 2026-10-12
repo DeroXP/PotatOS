@@ -5,6 +5,13 @@ data/
 node_modules/
 tests/e2e/screenshots/
 
+# benchmark outputs (bench/run-matrix.sh, bench.mjs) and its node_modules,
+# which bench/README suggests as a symlink (hence no trailing slash)
+bench/*.jsonl
+bench/bench.log
+bench/node_modules
+bench/package-lock.json
+
 # Editor / OS noise
 .DS_Store
 *.swp
@@ -13,3 +20,6 @@ tests/e2e/screenshots/
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Compose secrets for the GPU host (copied from .env.gpu.example)
+.env

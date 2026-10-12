@@ -1,0 +1,17 @@
+<!doctype html><html lang="en" data-base="/"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PotatOS (waking up)</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#1b1b1f;color:#eee;font:16px system-ui,sans-serif;text-align:center}p{color:#bbb}
+.d{width:28px;height:28px;margin:0 auto 16px;border:3px solid #e0a526;border-top-color:transparent;border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}</style></head>
+<body><main><div class="d"></div><h1>PotatOS is waking up</h1><p>The desktop is starting. This page refreshes by itself.</p>
+<script>
+// Served by nginx for 500/502/503/504 while the streaming server is not up yet
+// (the browser's address stays on the page that failed, so paths cannot be
+// relative: data-base is the SUBFOLDER, filled in at boot by 50-potatos-web).
+// Reload every 3 s once the server answers (a 401/403 = up, login wanted);
+// a direct visit to this file goes to the desktop instead.
+const BASE = document.documentElement.dataset.base || '/';
+setInterval(async () => {
+  try { const r = await fetch(BASE + 'api/health', { cache: 'no-store' }); if (!(r.ok || r.status === 401 || r.status === 403)) return; } catch { return; }
+  location.replace(location.pathname.endsWith('potatos-waking.html') ? BASE : location.href);
+}, 3000);
+</script></main></body></html>

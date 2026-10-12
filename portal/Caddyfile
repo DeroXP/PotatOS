@@ -1,0 +1,61 @@
+# PotatOS portal (see README.md in this directory).
+#
+# One address for two desktops:
+#   GET /anything  ->  probe https://GPU_HOST/healthz (2 s connect, 3 s response)
+#                      2xx       -> 302 https://GPU_HOST/anything   (home GPU desktop is up)
+#                      otherwise -> 302 https://CPU_HOST/anything   (PotatOS on Railway)
+#   GET /healthz   ->  200 "ok"  (Railway health check for the portal itself)
+#
+# Rules this file follows on purpose:
+#   - redirect, never proxy: the video stream must not flow through Railway
+#     (egress is billed per GB; 20-50 Mbit/s would be 9-22 GB per hour)
+#   - never contact CPU_HOST: the Railway desktop sleeps (Serverless) when it
+#     receives no traffic, and a probe from here would keep it awake
+#   - Cache-Control: no-store, so the browser asks again next time instead of
+#     remembering yesterday's answer
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+:{$PORT:8080} {
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle {
+		header Cache-Control "no-store"
+		# A GET to the GPU host's unauthenticated /healthz, with the visitor's
+		# own path kept aside for the redirect ({uri}).
+		reverse_proxy https://{$GPU_HOST} {
+			method GET
+			rewrite /healthz?
+			# Ask for GPU_HOST's own site: Caddy would otherwise pass the
+			# visitor's Host header (this portal's domain) through, the home
+			# Caddy would answer its empty "no such site" 200 even while the
+			# desktop container is down, and the visitor would land on a 502.
+			# The visitor's cookies / login never go to the probe either.
+			header_up Host {upstream_hostport}
+			header_up -Cookie
+			header_up -Authorization
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 3s
+			}
+			@up status 2xx
+			handle_response @up {
+				redir https://{$GPU_HOST}{uri} 302
+			}
+			handle_response {
+				redir https://{$CPU_HOST}{uri} 302
+			}
+		}
+	}
+
+	# unreachable / timeout / TLS failure on the probe
+	handle_errors {
+		header Cache-Control "no-store"
+		redir https://{$CPU_HOST}{uri} 302
+	}
+}

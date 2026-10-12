@@ -1,4 +1,5 @@
-# Keep the build context tiny: only Dockerfile + rootfs/ are needed.
+# Keep the build context tiny: only the Dockerfiles + rootfs/ are needed.
 *
 !Dockerfile
+!Dockerfile.gpu
 !rootfs/
