@@ -1,0 +1,12 @@
+{
+  "name": "potatos-e2e",
+  "private": true,
+  "description": "End-to-end browser test for PotatOS (drives the real streamed desktop)",
+  "type": "module",
+  "scripts": {
+    "test": "node desktop.test.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.56.1"
+  }
+}

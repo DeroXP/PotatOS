@@ -1,0 +1,140 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: streaming performance profiles.
+#
+#   POTATOS_PROFILE = potato | balanced (default) | ultra | custom
+#   POTATOS_RESOLUTION = auto | <width>x<height>   (optional, e.g. 1920x1080)
+#
+# A profile only fills in Selkies settings the user did NOT set. Anything you
+# pass yourself as SELKIES_<NAME>=... always wins. Values are written to
+# /run/s6/container_environment, which the Selkies service (svc-selkies, run
+# via with-contenv) reads when it starts right after this init phase.
+#
+# Selkies range syntax: "initial,min-max" (e.g. "60,8-120"). The user can still
+# move framerate/quality inside that range from the in-browser sidebar.
+
+ENV_DIR=/run/s6/container_environment
+PROFILE="${POTATOS_PROFILE:-balanced}"
+PROFILE="${PROFILE,,}"
+
+# Set NAME=VALUE for Selkies unless NAME is already present in the environment.
+set_default() {
+  local name="$1" value="$2"
+  if [ -n "${!name+x}" ]; then
+    echo "[potatos]   ${name}=${!name} (user override)"
+  else
+    printf '%s' "${value}" > "${ENV_DIR}/${name}"
+    export "${name}=${value}"
+    echo "[potatos]   ${name}=${value}"
+  fi
+}
+
+# The Dockerfile sets SELKIES_ENCODER to an empty marker, so a non-empty value
+# can only come from the user (or an older base image's own list, which we
+# treat the same way: it is a valid list either way).
+ALL_ENCODERS="h264enc,h265enc,vp8enc,vp9enc,av1enc,jpeg"
+set_encoders() {
+  if [ -n "${SELKIES_ENCODER}" ]; then
+    echo "[potatos]   SELKIES_ENCODER=${SELKIES_ENCODER} (user override)"
+  else
+    printf '%s' "$1" > "${ENV_DIR}/SELKIES_ENCODER"
+    echo "[potatos]   SELKIES_ENCODER=$1"
+  fi
+}
+
+# "false", "0", "no", "off" (optionally with a "|locked" suffix) -> true
+is_off() { case "${1%%|*}" in false|False|FALSE|0|no|No|off|Off) return 0 ;; *) return 1 ;; esac; }
+
+case "${PROFILE}" in
+  potato)
+    # Weak client and/or weak server: 720p, 30 fps, lower bitrate, and only
+    # codecs that every cheap laptop / old phone decodes in hardware or cheaply.
+    # The ranges are deliberately narrow: the web client keeps any value it
+    # saved for this site (e.g. 60 fps / CRF 25 from another profile, or from
+    # its own decoder-error recovery) as long as it is inside the range, so a
+    # wide range would let old settings silently override "potato".
+    DEFAULT_RES="1280x720"
+    echo "[potatos] Profile 'potato' (30 fps, 720p, low bitrate)"
+    set_default SELKIES_FRAMERATE      "30,8-30"
+    set_default SELKIES_VIDEO_CRF      "30,26-50"
+    set_default SELKIES_VIDEO_BITRATE  "3000,500-6000"
+    set_default SELKIES_USE_CSS_SCALING "true"
+    set_encoders "h264enc,vp8enc,jpeg"
+    ;;
+  balanced)
+    # Follows the browser window size (in CSS pixels so HiDPI screens do not
+    # quietly ask the server to encode 4K), 60 fps, room to go to 120.
+    DEFAULT_RES="auto"
+    echo "[potatos] Profile 'balanced' (60 fps, window-sized, medium bitrate)"
+    set_default SELKIES_FRAMERATE      "60,8-120"
+    set_default SELKIES_VIDEO_CRF      "25,5-50"
+    set_default SELKIES_VIDEO_BITRATE  "8000,100-1000000"
+    set_default SELKIES_USE_CSS_SCALING "true"
+    set_encoders "${ALL_ENCODERS}"
+    ;;
+  ultra)
+    # Strong server (6-8+ vCPU per 1440p@120 stream) and a decent client:
+    # 120 fps at the window size in CSS pixels, i.e. 2560x1440 for a full
+    # window on a 1440p monitor at 100% scaling. CSS scaling stays ON: with it
+    # off, a HiDPI client (Retina, 4K at 150-200%) would ask for 2880x1800 or
+    # 3840x2160 at 120 fps, far beyond 2K. Opt in to device pixels with
+    # SELKIES_USE_CSS_SCALING=false, or force 2K with POTATOS_RESOLUTION.
+    DEFAULT_RES="auto"
+    echo "[potatos] Profile 'ultra' (120 fps, window-sized up to your screen, high bitrate)"
+    set_default SELKIES_FRAMERATE      "120,8-120"
+    set_default SELKIES_VIDEO_CRF      "20,5-50"
+    set_default SELKIES_VIDEO_BITRATE  "20000,100-1000000"
+    set_default SELKIES_USE_CSS_SCALING "true"
+    set_encoders "${ALL_ENCODERS}"
+    ;;
+  custom)
+    DEFAULT_RES="auto"
+    echo "[potatos] Profile 'custom': no streaming tuning, using SELKIES_* as given"
+    set_encoders "${ALL_ENCODERS}"
+    ;;
+  *)
+    echo "[potatos] WARNING: unknown POTATOS_PROFILE='${PROFILE}', using Selkies defaults"
+    DEFAULT_RES="auto"
+    set_encoders "${ALL_ENCODERS}"
+    ;;
+esac
+
+# Fixed resolution (optional). "auto" = resize the desktop to the browser window.
+# Any explicit SELKIES_MANUAL_* setting wins: Selkies switches to locked manual
+# mode as soon as a width/height is present, so we must not inject one then.
+RES="${POTATOS_RESOLUTION:-${DEFAULT_RES}}"
+RES="${RES,,}"
+if [ -n "${SELKIES_MANUAL_RESOLUTION+x}${SELKIES_MANUAL_WIDTH+x}${SELKIES_MANUAL_HEIGHT+x}" ]; then
+  echo "[potatos] SELKIES_MANUAL_* set by you: not applying a profile resolution"
+elif [[ "${RES}" =~ ^([0-9]{3,5})x([0-9]{3,5})$ ]]; then
+  echo "[potatos] Fixed desktop resolution ${RES} (POTATOS_RESOLUTION=auto to follow the window)"
+  set_default SELKIES_MANUAL_WIDTH  "${BASH_REMATCH[1]}"
+  set_default SELKIES_MANUAL_HEIGHT "${BASH_REMATCH[2]}"
+elif [ "${RES}" != "auto" ]; then
+  echo "[potatos] WARNING: ignoring POTATOS_RESOLUTION='${RES}' (use auto or WIDTHxHEIGHT)"
+fi
+
+# Microphone + webcam: enabled, but the browser is only asked for permission
+# when an app inside the desktop actually opens the mic / camera ("demand").
+# Turning one off must LOCK it off: Selkies treats a plain "false" as the
+# default position of the sidebar toggle and keeps on-demand capture active.
+#   mic:    SELKIES_MICROPHONE_ENABLED=false  (or "false|locked")
+#   webcam: NO_WEBCAM=1 (base image; no /dev/video0) or SELKIES_WEBCAM_ENABLED=false
+# (The base image writes SELKIES_WEBCAM_ENABLED=true itself whenever it can
+# create /dev/video0, so for the webcam only NO_WEBCAM is reliable.)
+echo "[potatos] Mic/webcam policy"
+if [ -n "${SELKIES_MICROPHONE_ENABLED+x}" ] && is_off "${SELKIES_MICROPHONE_ENABLED}"; then
+  printf 'false|locked' > "${ENV_DIR}/SELKIES_MICROPHONE_ENABLED"
+  echo "[potatos]   SELKIES_MICROPHONE_ENABLED=false|locked (microphone off)"
+else
+  set_default SELKIES_MICROPHONE_ENABLED  "true"
+  set_default SELKIES_MICROPHONE_ON_START "demand"
+fi
+if [ -n "${NO_WEBCAM+x}" ] || is_off "${SELKIES_WEBCAM_ENABLED:-true}"; then
+  printf 'false|locked' > "${ENV_DIR}/SELKIES_WEBCAM_ENABLED"
+  echo "[potatos]   SELKIES_WEBCAM_ENABLED=false|locked (webcam off)"
+else
+  set_default SELKIES_WEBCAM_ON_START     "demand"
+fi
+printf '%s' "${PROFILE}" > "${ENV_DIR}/POTATOS_PROFILE"

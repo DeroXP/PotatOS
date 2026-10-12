@@ -1,0 +1,113 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: never expose a password-less desktop on the public internet by accident.
+#
+# If PASSWORD is empty AND we are on Railway (RAILWAY_* env present) or
+# POTATOS_REQUIRE_PASSWORD=true, generate a random password, enable nginx
+# basic auth (user: CUSTOM_USER, default "abc") and print it to the logs.
+# Set POTATOS_REQUIRE_PASSWORD=false to opt out (e.g. when you put your own
+# auth proxy in front).
+#
+# The generated password is stored in /config/.potatos/generated-password
+# (mode 600) so it stays the same across restarts when /config is a volume.
+# Delete that file to rotate it, or set PASSWORD yourself.
+# A password set at runtime with `potatos set-password` is kept as a hash in
+# /config/.potatos/htpasswd and re-applied here on every boot.
+#
+# Also: the WebSocket origin guard (see SELKIES_ALLOWED_ORIGINS in the
+# Dockerfile). Basic auth alone does not stop a foreign web page from driving
+# the desktop, because browsers re-send cached basic-auth credentials on its
+# cross-site WebSocket handshake. Selkies' same-origin check does.
+
+NGINX_CONFIG=/etc/nginx/http.d/default.conf
+ENV_DIR=/run/s6/container_environment
+STATE_DIR=/config/.potatos
+PW_FILE="${STATE_DIR}/generated-password"
+SAVED_HTPASSWD="${STATE_DIR}/htpasswd"
+CUSER="${CUSTOM_USER:-abc}"
+
+# --- WebSocket origin guard -------------------------------------------------
+if [[ ",${SELKIES_ALLOWED_ORIGINS// /}," == *",*,"* ]]; then
+  echo "[potatos] WARNING: SELKIES_ALLOWED_ORIGINS='*': any web page you visit can control this desktop"
+else
+  # GitHub Codespaces' port forwarder may not pass the public Host header
+  # through, which would make the browser's same-origin WebSocket look
+  # cross-origin. Allow the forwarded URL explicitly when we can see it
+  # (`potatos codespaces-setup` in postStartCommand does the same later, when
+  # these variables are only visible to lifecycle scripts).
+  # Origins added with `potatos allow-origin` (kept in /config across restarts).
+  if [ -r "${STATE_DIR}/allowed-origins" ]; then
+    while IFS= read -r SAVED_ORIGIN; do
+      [ -n "${SAVED_ORIGIN}" ] || continue
+      if [[ ",${SELKIES_ALLOWED_ORIGINS}," != *",${SAVED_ORIGIN},"* ]]; then
+        SELKIES_ALLOWED_ORIGINS="${SELKIES_ALLOWED_ORIGINS:+${SELKIES_ALLOWED_ORIGINS},}${SAVED_ORIGIN}"
+      fi
+    done < "${STATE_DIR}/allowed-origins"
+    printf '%s' "${SELKIES_ALLOWED_ORIGINS}" > "${ENV_DIR}/SELKIES_ALLOWED_ORIGINS"
+  fi
+  if [ -n "${CODESPACE_NAME}" ] && [ -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}" ]; then
+    CS_ORIGIN="https://${CODESPACE_NAME}-$(cat "${ENV_DIR}/POTATOS_HTTP_PORT" 2>/dev/null || echo 3000).${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+    if [[ ",${SELKIES_ALLOWED_ORIGINS}," != *",${CS_ORIGIN},"* ]]; then
+      SELKIES_ALLOWED_ORIGINS="${SELKIES_ALLOWED_ORIGINS:+${SELKIES_ALLOWED_ORIGINS},}${CS_ORIGIN}"
+      printf '%s' "${SELKIES_ALLOWED_ORIGINS}" > "${ENV_DIR}/SELKIES_ALLOWED_ORIGINS"
+    fi
+  fi
+  echo "[potatos] WebSocket origin guard: same-origin${SELKIES_ALLOWED_ORIGINS:+ + ${SELKIES_ALLOWED_ORIGINS}}"
+fi
+
+# --- Login ------------------------------------------------------------------
+# PASSWORD already set -> the base image's init-nginx enabled auth for us.
+if [ -n "${PASSWORD}" ]; then
+  echo "[potatos] Password protection: ON (PASSWORD is set, user '${CUSER}')"
+  exit 0
+fi
+
+# Password saved earlier with `potatos set-password`.
+if [ -s "${SAVED_HTPASSWD}" ]; then
+  install -m 644 "${SAVED_HTPASSWD}" /etc/nginx/.htpasswd
+  sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+  echo "[potatos] Password protection: ON (set with 'potatos set-password', user '$(cut -d: -f1 "${SAVED_HTPASSWD}")')"
+  exit 0
+fi
+
+REQUIRE="${POTATOS_REQUIRE_PASSWORD,,}"
+if [ -z "${REQUIRE}" ]; then
+  if [ -n "${RAILWAY_ENVIRONMENT}${RAILWAY_ENVIRONMENT_NAME}${RAILWAY_PROJECT_ID}" ]; then
+    REQUIRE=true
+  else
+    REQUIRE=false
+  fi
+fi
+
+if [ "${REQUIRE}" != "true" ]; then
+  echo "[potatos] Password protection: OFF (set PASSWORD to enable; fine for localhost / Codespaces private ports)"
+  exit 0
+fi
+
+mkdir -p "${STATE_DIR}"
+chmod 700 "${STATE_DIR}"
+if [ -s "${PW_FILE}" ]; then
+  GEN_PW="$(cat "${PW_FILE}")"
+  SOURCE="reused from ${PW_FILE}"
+else
+  # 20 chars from [A-Za-z0-9]; no symbols so it is easy to type on a phone.
+  GEN_PW="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
+  printf '%s' "${GEN_PW}" > "${PW_FILE}"
+  SOURCE="newly generated"
+fi
+chmod 600 "${PW_FILE}"
+chown -R root:root "${STATE_DIR}"
+
+# Same mechanism the base image uses when PASSWORD is set.
+printf '%s:%s\n' "${CUSER}" "$(openssl passwd -apr1 "${GEN_PW}")" > /etc/nginx/.htpasswd
+sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+
+cat <<EOF
+[potatos] ###########################################################
+[potatos] #  PotatOS login (HTTP basic auth, ${SOURCE})
+[potatos] #    user:     ${CUSER}
+[potatos] #    password: ${GEN_PW}
+[potatos] #  Set the PASSWORD variable to choose your own.
+[potatos] ###########################################################
+EOF

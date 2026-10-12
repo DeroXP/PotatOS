@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440">
+  <!-- PotatOS wallpaper (MIT). Plain shapes only, renders with librsvg. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1e2b"/>
+      <stop offset="0.55" stop-color="#2a2438"/>
+      <stop offset="1" stop-color="#3d2c2a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.68" cy="0.55" r="0.45">
+      <stop offset="0" stop-color="#f4b860" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#f4b860" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="skin" cx="0.38" cy="0.32" r="0.8">
+      <stop offset="0" stop-color="#f1cf8b"/>
+      <stop offset="0.6" stop-color="#d9a35a"/>
+      <stop offset="1" stop-color="#a8713a"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="2560" height="1440" fill="url(#sky)"/>
+  <rect width="2560" height="1440" fill="url(#glow)"/>
+
+  <!-- soft hills -->
+  <path d="M0 1180 C 420 1080 820 1160 1280 1120 S 2140 1040 2560 1130 L 2560 1440 L 0 1440 Z" fill="#231f2e"/>
+  <path d="M0 1270 C 520 1200 980 1290 1460 1240 S 2260 1190 2560 1250 L 2560 1440 L 0 1440 Z" fill="#1a1722"/>
+
+  <!-- the potato -->
+  <g transform="translate(1740 760) rotate(-14)">
+    <ellipse cx="0" cy="40" rx="330" ry="40" fill="#000" opacity="0.25" transform="translate(30 250)"/>
+    <path d="M -300 -40 C -320 -200 -150 -270 20 -250 C 210 -230 330 -150 320 10
+             C 312 170 170 250 -10 240 C -190 232 -285 130 -300 -40 Z"
+          fill="url(#skin)" stroke="#8a5a2c" stroke-width="6"/>
+    <g fill="#9b6634" opacity="0.75">
+      <ellipse cx="-150" cy="-110" rx="16" ry="10"/>
+      <ellipse cx="90" cy="-150" rx="12" ry="8"/>
+      <ellipse cx="200" cy="40" rx="15" ry="10"/>
+      <ellipse cx="-60" cy="130" rx="13" ry="9"/>
+      <ellipse cx="-220" cy="60" rx="10" ry="7"/>
+      <ellipse cx="60" cy="10" rx="9" ry="6"/>
+    </g>
+    <!-- a tiny terminal prompt on the potato -->
+    <rect x="-120" y="-60" width="210" height="120" rx="18" fill="#1b1e2b" opacity="0.88"/>
+    <text x="-95" y="18" font-family="DejaVu Sans Mono, monospace" font-size="64" font-weight="bold" fill="#8ee6a0">&gt;_</text>
+  </g>
+
+  <!-- wordmark, kept clear of the desktop icons on the left -->
+  <text x="420" y="660" font-family="DejaVu Sans, sans-serif" font-size="150" font-weight="bold" fill="#f3e6cf">Potat<tspan fill="#f4b860">OS</tspan></text>
+  <text x="426" y="740" font-family="DejaVu Sans, sans-serif" font-size="46" fill="#b9aec4">a whole Linux desktop, in any browser</text>
+</svg>

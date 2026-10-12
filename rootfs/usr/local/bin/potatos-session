@@ -1,0 +1,26 @@
+#!/bin/bash
+# PotatOS: runs inside the XFCE session (as user abc) at login.
+#
+# Thunar/xfdesktop 4.20 show an "Untrusted application launcher" dialog for
+# desktop launchers unless their checksum is stored in GIO metadata
+# (metadata::xfce-exe-checksum). Writing that metadata goes through
+# gvfsd-metadata on the *session* D-Bus, which is why this must run from the
+# session's autostart: `gio set` from `docker exec` (no session bus) fails with
+# "Setting attribute ... not supported".
+# We mark only files that are byte-identical to the launchers PotatOS ships,
+# never arbitrary files the user (or a download) put on the desktop.
+
+DESKTOP_DIR="${FILE_MANAGER_PATH:-${HOME}/Desktop}"
+LAUNCHERS=/usr/share/potatos/launchers
+
+for src in "${LAUNCHERS}"/*.desktop; do
+  f="${DESKTOP_DIR}/$(basename "${src}")"
+  if ! { [ -f "${f}" ] && cmp -s "${src}" "${f}"; }; then continue; fi
+  sum="$(sha256sum "${f}" | cut -d' ' -f1)"
+  current="$(gio info -a metadata::xfce-exe-checksum "${f}" 2>/dev/null | awk '/xfce-exe-checksum/ {print $2}')"
+  if [ "${current}" != "${sum}" ]; then
+    gio set -t string "${f}" metadata::xfce-exe-checksum "${sum}" \
+      || echo "potatos-session: could not mark ${f} as trusted" >&2
+  fi
+done
+exit 0

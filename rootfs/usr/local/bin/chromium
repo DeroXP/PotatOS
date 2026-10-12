@@ -1,0 +1,14 @@
+#!/bin/bash
+# PotatOS: Chromium wrapper (shadows /usr/bin/chromium via PATH).
+#
+# Chromium keeps renderer memory in /dev/shm. Docker's default is only 64 MB
+# and some hosts (e.g. Railway) do not let you raise it, which makes tabs
+# crash ("Aw, Snap!"). If /dev/shm is small, tell Chromium to use /tmp instead.
+# The base image's /usr/bin/chromium handles --no-sandbox etc.
+
+EXTRA=()
+shm_kb="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
+if [ -n "${shm_kb}" ] && [ "${shm_kb}" -lt 524288 ]; then
+  EXTRA+=(--disable-dev-shm-usage)
+fi
+exec /usr/bin/chromium "${EXTRA[@]}" "$@"

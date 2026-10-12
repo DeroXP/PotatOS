@@ -1,0 +1,24 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: optional extra Alpine packages installed at boot.
+#
+#   POTATOS_EXTRA_PACKAGES="firefox gimp"   (space or comma separated)
+#
+# Packages live in the container layer, not in /config, so they are
+# re-installed on every fresh container start. A failure here never blocks
+# the desktop from starting.
+
+PKGS="${POTATOS_EXTRA_PACKAGES//,/ }"
+if [ -z "${PKGS// /}" ]; then
+  exit 0
+fi
+
+echo "[potatos] Installing extra packages: ${PKGS}"
+# shellcheck disable=SC2086
+if apk add --no-cache ${PKGS}; then
+  echo "[potatos] Extra packages installed"
+else
+  echo "[potatos] WARNING: could not install some of: ${PKGS} (continuing anyway)"
+fi
+exit 0

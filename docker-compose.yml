@@ -1,0 +1,36 @@
+# PotatOS for your own machine / home server.
+#   docker compose up -d --build
+#   open http://localhost:3000
+# By default the desktop is reachable ONLY from this machine (no password).
+# For other PCs on your network see the 3001 line below.
+services:
+  potatos:
+    build: .
+    image: potatos:latest
+    container_name: potatos
+    ports:
+      - "127.0.0.1:3000:3000"   # HTTP, this machine only (mic/cam work on localhost)
+      # LAN access (opt-in). The desktop user has passwordless sudo and Docker
+      # ports bypass host firewalls such as ufw, so set PASSWORD first
+      # (or POTATOS_REQUIRE_PASSWORD=true), then uncomment and open
+      # https://<this-machine-ip>:3001 (self-signed certificate):
+      # - "3001:3001"
+    environment:
+      - PUID=1000                       # file owner of ./data on the host (id -u)
+      - PGID=1000                       # (id -g)
+      - TZ=Etc/UTC                      # e.g. Europe/Berlin
+      - PASSWORD=${PASSWORD:-}          # set to require a login (user: abc)
+      - POTATOS_REQUIRE_PASSWORD=${POTATOS_REQUIRE_PASSWORD:-}  # true = generate one if PASSWORD is empty (see `docker compose logs`)
+      - POTATOS_PROFILE=${POTATOS_PROFILE:-balanced}   # potato | balanced | ultra | custom
+      # - POTATOS_RESOLUTION=1920x1080  # lock the desktop size (default: follow the browser window)
+      # - POTATOS_EXTRA_PACKAGES=firefox gimp   # apk packages installed at every start
+    volumes:
+      - ./data:/config                  # home directory: files, settings, browser profile
+    # Chromium and the video pipeline use shared memory; Docker's 64 MB default is too small.
+    shm_size: "1gb"
+    # Not required: Chromium runs with --no-sandbox under Docker's default seccomp
+    # profile. Uncomment only if an app you install needs extra syscalls
+    # (it weakens isolation between the desktop and your host).
+    # security_opt:
+    #   - seccomp:unconfined
+    restart: unless-stopped

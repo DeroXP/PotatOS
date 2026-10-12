@@ -1,0 +1,15 @@
+# Local runtime data (the /config volume from docker-compose)
+data/
+
+# e2e test deps and output
+node_modules/
+tests/e2e/screenshots/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local Claude Code settings
+.claude/settings.local.json

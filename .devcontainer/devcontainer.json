@@ -1,0 +1,52 @@
+// PotatOS in GitHub Codespaces.
+// The Codespace container *is* the desktop: its normal init (/init, s6) is kept
+// running, nginx serves the desktop on port 3000 and Codespaces forwards it over
+// HTTPS (so mic/webcam work). Open the "PotatOS Desktop" port if the browser tab
+// does not pop up by itself.
+//
+// Login: add a Codespaces secret named POTATOS_PASSWORD (GitHub Settings ->
+// Codespaces -> Secrets, give this repo access). Secrets never reach the
+// container's entrypoint, so postStartCommand applies it (`potatos
+// codespaces-setup`). Do NOT put a password in containerEnv below: this file
+// is committed, and may be public.
+{
+  "name": "PotatOS",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  // Keep the image's own entrypoint (s6-overlay) instead of `sleep infinity`.
+  "overrideCommand": false,
+  "runArgs": ["--shm-size=1g"],
+  "containerEnv": {
+    "POTATOS_PROFILE": "balanced",
+    "TZ": "Etc/UTC"
+  },
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "PotatOS Desktop",
+      "onAutoForward": "openBrowser"
+    },
+    "3001": { "onAutoForward": "ignore" },
+    "8082": { "onAutoForward": "ignore" }
+  },
+  "otherPortsAttributes": { "onAutoForward": "ignore" },
+  // Minimum only: 2 cores work for the potato profile; pick a 4-core machine
+  // for 1080p60 ("New with options" on GitHub).
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb"
+  },
+  "remoteUser": "root",
+  "updateRemoteUserUID": false,
+  // Allows the forwarded URL as a WebSocket origin and applies the
+  // POTATOS_PASSWORD secret, if any. Waits for the desktop to finish booting.
+  "postStartCommand": "potatos codespaces-setup",
+  "postAttachCommand": "echo 'PotatOS desktop: open the forwarded port 3000 (PORTS tab). Profile/CPU info: potatos info. Files outside /workspaces are lost on a rebuild.'",
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["README.md"]
+    }
+  }
+}

@@ -1,0 +1,63 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: HTTP port + health endpoint.
+#
+# Boot order in the base image (s6-rc):
+#   init-nginx (writes /etc/nginx/http.d/default.conf from CUSTOM_PORT etc.)
+#     -> ... -> init-custom-files (runs THIS directory) -> svc-nginx (starts nginx)
+# So by the time we run, the config exists but nginx is not running yet:
+# editing the file here is enough, no reload needed.
+#
+# 1. PaaS hosts such as Railway tell the app which port to listen on via
+#    $PORT. If PORT is set and CUSTOM_PORT is not, move the HTTP listener there.
+# 2. Add an unauthenticated `GET /healthz` so health checks keep working when
+#    a PASSWORD (basic auth) is enabled.
+
+NGINX_CONFIG=/etc/nginx/http.d/default.conf
+
+if [ ! -f "${NGINX_CONFIG}" ]; then
+  echo "[potatos] WARNING: ${NGINX_CONFIG} not found, skipping port setup"
+  exit 0
+fi
+
+# Port the base image already configured (CUSTOM_PORT or 3000).
+CURRENT_PORT="${CUSTOM_PORT:-3000}"
+
+if [ -n "${PORT}" ] && [ -z "${CUSTOM_PORT}" ]; then
+  if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+    echo "[potatos] WARNING: ignoring invalid PORT='${PORT}'"
+  elif [ "${PORT}" = "${CUSTOM_HTTPS_PORT:-3001}" ] || [ "${PORT}" = "${CUSTOM_WS_PORT:-8082}" ]; then
+    echo "[potatos] WARNING: PORT=${PORT} clashes with an internal port; set CUSTOM_PORT instead"
+  elif [ "${PORT}" != "${CURRENT_PORT}" ]; then
+    # Only touch the plain-HTTP `listen` lines (the HTTPS ones say `ssl`).
+    sed -i -E "s/listen (\[::\]:)?${CURRENT_PORT} default_server;/listen \1${PORT} default_server;/" "${NGINX_CONFIG}"
+    CURRENT_PORT="${PORT}"
+    echo "[potatos] PORT is set: nginx will listen on ${PORT} (HTTP)"
+  fi
+  # PaaS mode: the platform terminates TLS. Keep the self-signed HTTPS
+  # listener off the public interfaces, so the platform sees exactly one port
+  # (Railway would otherwise offer 3001 as a domain target, and plain HTTP
+  # sent to a TLS port answers every request with 400).
+  HTTPS_PORT="${CUSTOM_HTTPS_PORT:-3001}"
+  sed -i -E -e "/listen \[::\]:${HTTPS_PORT} ssl;/d" \
+            -e "s/listen ${HTTPS_PORT} ssl;/listen 127.0.0.1:${HTTPS_PORT} ssl;/" "${NGINX_CONFIG}"
+  echo "[potatos] PORT is set: HTTPS :${HTTPS_PORT} only on 127.0.0.1 (TLS is terminated by the platform)"
+fi
+
+# Some hosts/kernels have no IPv6 at all; nginx then refuses to start because
+# of the `listen [::]:...` lines. Drop them automatically (same as the base
+# image's DISABLE_IPV6=true).
+if [ ! -s /proc/net/if_inet6 ] && grep -q 'listen \[::\]' "${NGINX_CONFIG}"; then
+  sed -i '/listen \[::\]/d' "${NGINX_CONFIG}"
+  echo "[potatos] No IPv6 on this host: nginx will listen on IPv4 only"
+fi
+
+# Record the effective port for tools inside the container (`potatos info`).
+printf '%s' "${CURRENT_PORT}" > /run/s6/container_environment/POTATOS_HTTP_PORT
+
+# Unauthenticated health endpoint in every server block (idempotent: the base
+# image regenerates the config on each boot, but guard anyway).
+if ! grep -q 'location = /healthz' "${NGINX_CONFIG}"; then
+  sed -i 's#^server {$#server {\n  location = /healthz { auth_basic off; access_log off; default_type text/plain; return 200 "ok"; }#' "${NGINX_CONFIG}"
+fi

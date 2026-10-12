@@ -1,0 +1,4 @@
+# Keep the build context tiny: only Dockerfile + rootfs/ are needed.
+*
+!Dockerfile
+!rootfs/

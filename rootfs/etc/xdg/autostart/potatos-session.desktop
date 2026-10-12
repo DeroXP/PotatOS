@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PotatOS session setup
+Comment=Marks the stock PotatOS desktop launchers as trusted
+Exec=/usr/local/bin/potatos-session
+NoDisplay=true
+OnlyShowIn=XFCE;
+X-XFCE-Autostart-Override=true

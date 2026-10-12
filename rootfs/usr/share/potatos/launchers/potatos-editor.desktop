@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Text Editor
+Comment=Edit text files
+Exec=mousepad %F
+Icon=org.xfce.mousepad
+Terminal=false
+StartupNotify=true
+Categories=Utility;TextEditor;

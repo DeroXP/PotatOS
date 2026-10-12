@@ -1,0 +1,50 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# PotatOS: first-boot desktop setup for user abc (HOME=/config).
+#
+# Runs once per /config volume (marker file below), so anything the user
+# changes or deletes afterwards stays that way. Never overwrites existing files.
+#   - Desktop launchers: Browser, Terminal, Files, Text Editor, Task Manager
+#   - Chromium as the preferred web browser for XFCE
+# The PotatOS wallpaper is set via /defaults/xfce (rootfs/defaults/xfce/xfce4-desktop.xml),
+# which the base image copies only when the user has no XFCE config yet.
+
+HOME_DIR="${HOME:-/config}"
+DESKTOP_DIR="${FILE_MANAGER_PATH:-${HOME_DIR}/Desktop}"
+MARKER="${HOME_DIR}/.potatos/desktop-seeded-v1"
+LAUNCHERS=/usr/share/potatos/launchers
+
+mkdir -p "${HOME_DIR}/.potatos"
+
+if [ -f "${MARKER}" ]; then
+  echo "[potatos] Desktop already set up on this volume, leaving it alone"
+  exit 0
+fi
+
+echo "[potatos] First boot: adding desktop launchers"
+mkdir -p "${DESKTOP_DIR}"
+for src in "${LAUNCHERS}"/*.desktop; do
+  dst="${DESKTOP_DIR}/$(basename "${src}")"
+  if [ ! -e "${dst}" ]; then
+    cp "${src}" "${dst}"
+    # Desktop launchers must be executable to be runnable from xfdesktop.
+    chmod 755 "${dst}"
+  fi
+done
+# GitHub Codespaces: a container rebuild wipes /config; only /workspaces
+# survives. Put a shortcut to it on the desktop so files land somewhere safe.
+if [ -d /workspaces ] && [ ! -e "${DESKTOP_DIR}/workspaces" ]; then
+  ln -s /workspaces "${DESKTOP_DIR}/workspaces"
+fi
+chown -R abc:abc "${DESKTOP_DIR}"
+
+# Preferred applications (used by exo-open / "Web Browser" menu entries).
+HELPERS="${HOME_DIR}/.config/xfce4/helpers.rc"
+if [ ! -f "${HELPERS}" ]; then
+  mkdir -p "$(dirname "${HELPERS}")"
+  printf 'WebBrowser=chromium\nTerminalEmulator=xfce4-terminal\nFileManager=thunar\n' > "${HELPERS}"
+  chown -R abc:abc "${HOME_DIR}/.config/xfce4"
+fi
+
+touch "${MARKER}"

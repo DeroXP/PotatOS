@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Task Manager
+Comment=See what is using CPU and memory
+Exec=xfce4-taskmanager
+Icon=org.xfce.taskmanager
+Terminal=false
+StartupNotify=true
+Categories=System;Monitor;

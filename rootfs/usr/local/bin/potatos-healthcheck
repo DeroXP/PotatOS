@@ -1,0 +1,8 @@
+#!/bin/sh
+# PotatOS: Docker HEALTHCHECK. Healthy = nginx answers /healthz AND the
+# Selkies streaming server is running.
+PORT="$(cat /run/s6/container_environment/POTATOS_HTTP_PORT 2>/dev/null)"
+PORT="${PORT:-${CUSTOM_PORT:-3000}}"
+curl -fsS -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/healthz" || exit 1
+pgrep -f 'bin/selkies' >/dev/null || exit 1
+exit 0

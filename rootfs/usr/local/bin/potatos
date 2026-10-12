@@ -1,0 +1,158 @@
+#!/bin/bash
+# potatos - tiny helper CLI for PotatOS. Run `potatos help`.
+set -u
+
+ENV_DIR=/run/s6/container_environment
+NGINX_CONFIG=/etc/nginx/http.d/default.conf
+STATE_DIR=/config/.potatos
+
+# Read a variable the way the services see it (s6 container environment).
+envval() {
+  if [ -r "${ENV_DIR}/$1" ]; then cat "${ENV_DIR}/$1"; else printf '%s' "${!1:-}"; fi
+}
+
+cmd_info() {
+  local cpus mem_total mem_avail shm
+  cpus="$(nproc 2>/dev/null)"
+  mem_total="$(awk '/MemTotal/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
+  mem_avail="$(awk '/MemAvailable/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
+  shm="$(df -h /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
+  cat <<EOF
+PotatOS
+  OS:          $(. /etc/os-release && echo "${PRETTY_NAME}")
+  Profile:     $(envval POTATOS_PROFILE)
+  HTTP port:   $(envval POTATOS_HTTP_PORT) (HTTPS: $(envval CUSTOM_HTTPS_PORT | grep . || echo 3001))
+  CPU:         ${cpus} vCPU   Memory: ${mem_avail} free of ${mem_total}   /dev/shm: ${shm}
+  GPU:         $( [ -e /dev/dri/renderD128 ] && echo "render node found (hardware encode possible)" || echo "none (software encoding)")
+Streaming (Selkies)
+  Framerate:   $(envval SELKIES_FRAMERATE | grep . || echo "default")
+  Video CRF:   $(envval SELKIES_VIDEO_CRF | grep . || echo "default")
+  Bitrate:     $(envval SELKIES_VIDEO_BITRATE | grep . || echo "default") kbps
+  Encoders:    $(envval SELKIES_ENCODER)
+  Resolution:  $(r="$(envval SELKIES_MANUAL_WIDTH)"; [ -n "$r" ] && [ "$r" != 0 ] && echo "${r}x$(envval SELKIES_MANUAL_HEIGHT) (fixed)" || echo "follows browser window")
+  Origins:     same-origin$(o="$(envval SELKIES_ALLOWED_ORIGINS)"; [ -n "$o" ] && echo " + $o")
+  Mic/Webcam:  mic=$(envval SELKIES_MICROPHONE_ENABLED)/$(envval SELKIES_MICROPHONE_ON_START)  webcam=$(envval SELKIES_WEBCAM_ENABLED)/$(envval SELKIES_WEBCAM_ON_START)
+EOF
+}
+
+cmd_install() {
+  [ $# -gt 0 ] || { echo "usage: potatos install <package>..." >&2; exit 2; }
+  echo "Installing with apk: $*"
+  echo "(Packages live in the container, not /config. To keep them across"
+  echo " re-deploys, add them to the POTATOS_EXTRA_PACKAGES variable.)"
+  sudo apk add --no-cache "$@"
+}
+
+cmd_search() {
+  [ $# -gt 0 ] || { echo "usage: potatos search <term>" >&2; exit 2; }
+  apk --no-cache search -v "$@" 2>/dev/null | head -40
+}
+
+need_root() {
+  [ "$(id -u)" = 0 ] && return 0
+  exec sudo -E "$0" "$@"
+}
+
+nginx_reload() {
+  # reload is asynchronous: give the new workers a moment before returning
+  if pgrep -x nginx >/dev/null 2>&1; then nginx -s reload && sleep 2 && echo "nginx reloaded"; fi
+}
+
+# Wait until boot has finished (nginx up), so we do not race init-nginx, which
+# rewrites the nginx config on every container start.
+wait_for_boot() {
+  local i
+  for i in $(seq 1 180); do
+    pgrep -x nginx >/dev/null 2>&1 && [ -s "${ENV_DIR}/POTATOS_HTTP_PORT" ] && return 0
+    sleep 1
+  done
+  echo "potatos: nginx did not come up within 180 s" >&2
+  return 1
+}
+
+# potatos set-password [<password> | --off]
+# Without an argument uses $POTATOS_PASSWORD, then $PASSWORD (e.g. from a
+# Codespaces secret). Stored as a hash in /config/.potatos/htpasswd and
+# re-applied on every boot by 30-potatos-security.
+cmd_set_password() {
+  local pw="${1:-${POTATOS_PASSWORD:-${PASSWORD:-}}}" user line
+  if [ "${pw}" = "--off" ]; then
+    rm -f "${STATE_DIR}/htpasswd"
+    sed -i -E 's/^([[:space:]]*)auth_basic/\1#auth_basic/' "${NGINX_CONFIG}"
+    nginx_reload
+    echo "Password protection OFF (a PASSWORD variable, if set, turns it back on at the next start)."
+    return 0
+  fi
+  [ -n "${pw}" ] || { echo "usage: potatos set-password <password>   (or set POTATOS_PASSWORD / PASSWORD)" >&2; exit 2; }
+  user="$(envval CUSTOM_USER)"; user="${user:-abc}"
+  line="${user}:$(openssl passwd -apr1 "${pw}")"
+  mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
+  ( umask 077; printf '%s\n' "${line}" > "${STATE_DIR}/htpasswd" )
+  printf '%s\n' "${line}" > /etc/nginx/.htpasswd
+  chmod 644 /etc/nginx/.htpasswd
+  sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+  nginx_reload
+  echo "Password protection ON (user '${user}')."
+}
+
+# potatos allow-origin <https://host[:port]>
+# Let a browser page on that origin open the streaming WebSocket (needed only
+# behind a proxy that rewrites the Host header). Restarts the stream server.
+cmd_allow_origin() {
+  local origin="${1:-}" cur
+  [ -n "${origin}" ] || { echo "usage: potatos allow-origin https://host[:port]" >&2; exit 2; }
+  cur="$(envval SELKIES_ALLOWED_ORIGINS)"
+  case ",${cur}," in
+    *",${origin},"*|*",*,"*) echo "origin already allowed: ${origin}"; return 0 ;;
+  esac
+  printf '%s' "${cur:+${cur},}${origin}" > "${ENV_DIR}/SELKIES_ALLOWED_ORIGINS"
+  # Remember it: the s6 environment is rebuilt on every boot, and
+  # 30-potatos-security re-applies this list.
+  mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
+  grep -qxF "${origin}" "${STATE_DIR}/allowed-origins" 2>/dev/null \
+    || printf '%s\n' "${origin}" >> "${STATE_DIR}/allowed-origins"
+  echo "allowed origin: ${origin} (kept across restarts)"
+  if [ -d /run/service/svc-selkies ]; then
+    s6-svc -r /run/service/svc-selkies && echo "stream server restarted (reload the browser tab)"
+  fi
+}
+
+# For .devcontainer postStartCommand: lifecycle scripts see the Codespace's
+# name and its secrets, the container's own boot scripts may not.
+cmd_codespaces_setup() {
+  wait_for_boot || exit 1
+  if [ -n "${CODESPACE_NAME:-}" ] && [ -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]; then
+    cmd_allow_origin "https://${CODESPACE_NAME}-$(envval POTATOS_HTTP_PORT).${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+  fi
+  if [ -n "${POTATOS_PASSWORD:-}${PASSWORD:-}" ]; then
+    cmd_set_password
+  else
+    echo "No POTATOS_PASSWORD secret: the desktop has no login. Keep port 3000 private."
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+potatos - PotatOS helper
+
+  potatos info               show profile, streaming settings and resources
+  potatos install <pkg>...   install Alpine packages (apk), e.g. potatos install firefox
+  potatos search <term>      search Alpine packages
+  potatos set-password [pw]  require a login (user abc); --off removes it
+  potatos allow-origin <url> allow a web origin to open the stream (behind Host-rewriting proxies;
+                             saved in /config/.potatos/allowed-origins)
+  potatos codespaces-setup   used by .devcontainer (origin + password from secrets)
+  potatos help               this help
+EOF
+}
+
+case "${1:-help}" in
+  info)    shift; cmd_info "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  search)  shift; cmd_search "$@" ;;
+  set-password)     need_root "$@"; shift; cmd_set_password "$@" ;;
+  allow-origin)     need_root "$@"; shift; cmd_allow_origin "$@" ;;
+  codespaces-setup) need_root "$@"; shift; cmd_codespaces_setup "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) echo "unknown command: $1" >&2; cmd_help >&2; exit 2 ;;
+esac
