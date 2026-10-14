@@ -82,3 +82,37 @@ if ! grep -q 'potatos-waking' "${NGINX_CONFIG}"; then
     -e "s#^server \{\$#server {\n  location = ${SF}potatos-up { internal; proxy_pass http://127.0.0.1:${CUSTOM_WS_PORT:-8082}${SF}api/health; proxy_connect_timeout 2s; proxy_read_timeout 2s; }\n  location = ${SF}potatos-waking.html { auth_basic off; auth_request off; alias ${WEB}/potatos-waking.html; }\n  location = ${SF}potatos-paused.html { auth_basic off; auth_request off; alias ${WEB}/potatos-paused.html; }#" \
     "${NGINX_CONFIG}"
 fi
+
+# Hardening, in every server block (the stock config has no add_header of its
+# own, so these reach every location, the 401 page and the waking page too):
+#   - response headers that the Selkies dashboard tolerates: no MIME sniffing,
+#     no framing by other sites (X-Frame-Options for old browsers, CSP
+#     frame-ancestors for new ones; NO other CSP directive, the React bundle
+#     needs its blob: workers and data: URIs), referrer trimmed to the origin
+#     on other sites, camera/mic/clipboard for this origin only, no nginx
+#     version. HSTS only on the HTTPS listener (and without includeSubDomains).
+#   - login rate limit: requests WITHOUT the correct login are limited to
+#     30/min per client address after a burst of 20 (429). A logged-in browser
+#     sends the login with every request and WebSocket, so it is never counted
+#     (key map: /etc/nginx/potatos-auth.conf, root-only, written by
+#     30-potatos-security and `potatos set-password`). No login, no limit.
+#     A page load is 11 requests + 1 WebSocket and 1 challenge (401).
+#   - at most 100 requests/WebSockets in flight per client address (429).
+if ! grep -q 'potatos_login' "${NGINX_CONFIG}"; then
+  [ -f "${NGINX_AUTH_CONF}" ] || nginx_login_limit ""
+  sed -i -E \
+    -e "s#^server \{\$#server {\n  server_tokens off;\n  add_header X-Content-Type-Options nosniff always;\n  add_header X-Frame-Options SAMEORIGIN always;\n  add_header Content-Security-Policy \"frame-ancestors 'self'\" always;\n  add_header Referrer-Policy strict-origin-when-cross-origin always;\n  add_header Permissions-Policy \"camera=(self), microphone=(self), clipboard-read=(self), clipboard-write=(self)\" always;\n  limit_req zone=potatos_login burst=20 nodelay;\n  limit_req_status 429;\n  limit_conn potatos_conn 100;\n  limit_conn_status 429;#" \
+    -e "s#^(  ssl_certificate_key .*)\$#\1\n  add_header Strict-Transport-Security \"max-age=31536000\" always;#" \
+    "${NGINX_CONFIG}"
+  # (http level: the site file is included inside nginx.conf's http block)
+  { printf 'include %s;\n' "${NGINX_AUTH_CONF}"
+    printf 'limit_req_zone $potatos_login_key zone=potatos_login:1m rate=30r/m;\n'
+    printf 'limit_conn_zone $binary_remote_addr zone=potatos_conn:1m;\n'
+    cat "${NGINX_CONFIG}"; } > "${NGINX_CONFIG}.potatos" && cat "${NGINX_CONFIG}.potatos" > "${NGINX_CONFIG}" && rm -f "${NGINX_CONFIG}.potatos"
+fi
+# Access and error logs hold visitor addresses and paths: root-only. nginx
+# (started after this script) creates missing ones with mode 644, so create
+# them first; its master process opens them as root.
+for f in /var/log/nginx/access.log /var/log/nginx/error.log; do
+  if [ -d /var/log/nginx ] && [ ! -L "${f}" ]; then ( umask 077; : >> "${f}" ); chown root:root "${f}"; chmod 600 "${f}"; fi
+done

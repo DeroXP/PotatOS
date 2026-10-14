@@ -11,6 +11,10 @@
 //   --cpuset 0,1      docker --cpuset-cpus (pins to those cores: nproc shows 2)
 //   --viewport none   no client at all (idle server)
 //   --workload        none | static | motion | term | anim | move  (see workload.sh)
+//   --hidden          fake a hidden tab (the client sends STOP_VIDEO)
+//   --shaded          hide the tab for 1 s and show it again: the privacy shade stays
+//                     up (until a click) while the stream plays underneath; compare
+//                     client_cpu_pct with a run without it
 //   --keep            leave the containers running (prints their names)
 //
 // What is measured (window = after stream is up + workload warm-up):
@@ -49,7 +53,7 @@ const A = { env: [], cpus: '', cpuset: '', profile: 'balanced', viewport: '1920x
   label: '', keep: false, chromiumFlags: '', clientCpus: '', settle: 6, statsOff: false };
 for (let i = 2; i < process.argv.length; i++) {
   const k = process.argv[i].replace(/^--/, '');
-  if (k === 'keep' || k === 'statsOff' || k === 'hidden' || k === 'disconnect') { A[k] = true; continue; }
+  if (k === 'keep' || k === 'statsOff' || k === 'hidden' || k === 'disconnect' || k === 'shaded') { A[k] = true; continue; }
   const v = process.argv[++i];
   if (Array.isArray(A[k])) A[k].push(v); else A[k] = ['dur', 'warmup', 'port', 'settle'].includes(k) ? Number(v) : v;
 }
@@ -189,7 +193,7 @@ async function main() {
   await sleep(A.settle * 1000);
 
   const result = { label: A.label, ts: new Date().toISOString(), image: A.image, cpus: A.cpus || 'host', cpuset: A.cpuset || '', profile: A.profile,
-    env: A.env, hidden: !!A.hidden, disconnect: !!A.disconnect, chromium_flags: A.chromiumFlags, viewport: A.viewport, workload: A.workload, dur: A.dur, boot_s: bootS,
+    env: A.env, hidden: !!A.hidden, shaded: !!A.shaded, disconnect: !!A.disconnect, chromium_flags: A.chromiumFlags, viewport: A.viewport, workload: A.workload, dur: A.dur, boot_s: bootS,
     host_load_start: Math.round(os.loadavg()[0] * 10) / 10 };
 
   let browser = null, page = null;
@@ -218,6 +222,14 @@ async function main() {
         Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
         document.dispatchEvent(new Event('visibilitychange')); });
       log('client tab marked hidden');
+    }
+    if (A.shaded) { // back to the tab: the privacy shade stays up until a click, the stream plays underneath
+      const vis = (h) => page.evaluate((h) => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => h });
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (h ? 'hidden' : 'visible') });
+        document.dispatchEvent(new Event('visibilitychange')); }, h);
+      await vis(true); await sleep(1000); await vis(false);
+      result.shade = await page.evaluate(() => ({ up: !!document.getElementById('potatos-shade'), still: !!document.getElementById('potatos-shade-still') }));
+      log(`privacy shade up ${JSON.stringify(result.shade)}`);
     }
     if (A.disconnect) { // connect, stream, then the user closes the tab: what keeps running?
       await sleep(5000);

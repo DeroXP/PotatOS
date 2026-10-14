@@ -19,9 +19,10 @@ years can do.
 - Microphone and webcam from your browser. Your browser asks for permission
   only when an app inside the desktop actually uses them.
 - Cheap when nobody is looking: after 10 minutes without a viewer the desktop
-  is frozen (CPU ~0, no network packets), so Railway's Serverless mode can put
-  the service to sleep, and it resumes instantly when you come back. Open apps
-  and browser tabs survive a restart. See [Idle & sleep](#idle--sleep).
+  is frozen (about 1 % of one core, no network packets), so Railway's
+  Serverless mode can put the service to sleep, and it resumes instantly when
+  you come back. Open apps and browser tabs survive a restart. See
+  [Idle & sleep](#idle--sleep).
 - Up to 120 fps and up to 2K (2560x1440) are *allowed*; what you get depends
   on server CPU. Read [Performance](#performance-the-honest-part) first.
 - Works through plain HTTPS proxies (WebSockets). No UDP, TURN server or extra
@@ -152,7 +153,8 @@ allows enough for every profile.
    **never 3001**. Open the `https://...up.railway.app` URL. It is HTTPS, so
    the mic and webcam work.
 6. **CPU:** video encoding uses the CPU (Railway has no GPUs). 1080p at 30 fps
-   wants 2-4 vCPU and 2 GB RAM; 60 fps about twice that. See
+   wants 2-4 vCPU and 2 GB RAM; 1080p60 wants 4 vCPU (2 vCPU managed ~50 fps
+   under heavy motion). See
    [Performance](#performance-the-honest-part). Pro plans burst to 24 vCPU per
    replica automatically; there is no instance size to pick.
 7. **Sleep when idle (recommended):** **Settings → Deploy → Serverless →
@@ -213,7 +215,7 @@ resources the Codespace has.
 
 ## Your own GPU PC, and the portal
 
-Software encoding tops out around 1440p at 35 fps on 4 vCPU (see
+Software encoding tops out around 1440p at 40-45 fps on 4 vCPU (see
 [Performance](#performance-the-honest-part)); Railway and Codespaces have no
 GPUs. A PC at home with an NVIDIA card does have a hardware encoder (NVENC),
 and NVIDIA's libraries need glibc, so PotatOS has a second image for it:
@@ -274,10 +276,11 @@ the boot log says `Profile 'auto' on N vCPU`). On Railway, run `nproc; cat
 > `POTATOS_RESOLUTION=auto` to stream the window's own size at 30 fps.
 
 All profiles share the measured speed defaults: Turbo mode locked off (it
-re-encodes identical frames, 5x the CPU on a still desktop), CRF 28 (about
--27 % bandwidth and -8 % encoder CPU vs CRF 25 at the same fps; CRF 30 would
-be -42 %), the window compositor off, Opus at 64 / 96 / 128 kbps for potato
-/ balanced / ultra.
+re-encodes identical frames: a still 1080p60 desktop with a viewer costs
+51 % of a core instead of 14 %), CRF 28 (-13 to -27 % bandwidth vs CRF 25
+depending on the content, same fps and CPU; CRF 30 would be -42 %), the
+window compositor off, Opus at 64 / 96 / 128 kbps for potato / balanced /
+ultra.
 
 > **Switching profiles:** the web client remembers the framerate and quality
 > you last used on that site and keeps them if they are inside the new
@@ -329,8 +332,9 @@ core and phones home every 45 s (keepalives, update checks, DNS). The
    `SIGSTOP` to every desktop process except the streaming core (X server,
    Selkies, PulseAudio, D-Bus) and kills the browser's network-service
    process so its sockets close (Chromium respawns it in ~1 s when it
-   continues). Measured: **0.6-0.9 % CPU and 0 outbound packets** while
-   frozen, versus 9-13 % and ~4 packets/s with the same apps running.
+   continues). Measured: **about 1 % of one core (1.1-1.3 %) and 0 outbound
+   packets** in 60 s while frozen, versus 9-13 % and ~4 packets/s with a
+   browser and a few tabs running (36 % with a page running a CSS animation).
 2. **A page load or a new connection thaws everything** (`SIGCONT`), about
    0.2 s before the first frame, so you never see a stale picture. Only
    requests nginx answered with 2xx, 101 or 304 count: an internet scanner hitting a
@@ -361,7 +365,7 @@ Railway sleeps the service. Expect, in order:
 - 0-10 min after you leave: desktop running, ~1 % CPU with nothing open,
   9-13 % with a browser open (and it keeps sending packets, so Railway will
   not sleep yet), RAM billed.
-- 10 min: frozen. CPU ~0, still RAM billed.
+- 10 min: frozen. CPU about 1 % of one core, still RAM billed.
 - 15-20 min: asleep. No compute charges; volume storage ($0.15/GB-month) still
   billed.
 - You come back: the **first request may return a 502** from Railway's edge
@@ -462,19 +466,26 @@ applies it live (`Applying video settings ... live (no restart)` in the log)
 and the HUD shows `[ECO]`. What it saves is capture work, not frames: at a
 120 fps target the screen is grabbed 120 times a second even when the page
 only changes 60 times (the encoder, with Turbo off, only emits changed
-frames). Measured with a 60 Hz CSS animation, H.264 1080p, 4 vCPU: eco
-halves the grabs, Selkies CPU -21 %, Xvfb -37 %, encoded fps unchanged at
-60. `POTATOS_ECO=off` disables it. The marker that remembers the original
+frames). Measured with a 60 Hz CSS animation, H.264 1080p at a 120 fps
+target (4-vCPU host, software x264): eco halves the grabs, Selkies CPU
+-14 to -21 %, Xvfb -39 to -42 %, container CPU -10 %, encoded fps unchanged
+at 60. `POTATOS_ECO=off` disables it. The marker that remembers the original
 target is per tab; leaving the page (pause, close) restores the target so
 the next client does not start at 60.
 
 ### Privacy shade
 
 On by default: when the tab goes to the background the stream is blurred
-(CSS) and a "click or press a key to show the desktop" overlay appears. It
+and a "click or press a key to show the desktop" overlay appears. It
 stays blurred until you click or press a key, so someone glancing at your
-screen while you switch tabs sees nothing. `POTATOS_PRIVACY_SHADE=focus`
-also blurs when the browser window loses focus; `off` disables it.
+screen while you switch tabs sees nothing. What you see under the overlay is
+a blurred still of the last frame, not the live stream run through a CSS
+blur: that is re-blurred on every frame and on every HUD update, which on a
+client without GPU compositing measured 130 % of a core instead of 35 % with
+motion on screen and 51-55 % instead of 10 % on a still one (1080p60).
+Revealing is instant because the stream keeps playing underneath.
+`POTATOS_PRIVACY_SHADE=focus` also blurs when the browser window loses
+focus; `off` disables it.
 
 ### Pausing: hidden and idle tabs
 
@@ -547,49 +558,73 @@ Chromium with a warning.
   Codespaces, so every frame is encoded in software (x264 for H.264, which is
   what Chrome, Edge, Safari and Firefox get). Cost = pixels × frames per
   second × how much of the screen changes. x264 runs `ultrafast`/`zerolatency`
-  and uses at most **4 threads**, so more than 4 vCPU does not make one
-  stream faster.
-- **Measured** with the harness in [bench/](bench/) (H.264 to a real Chromium
-  client, a 4-vCPU box shared with other work, so treat ±10 % as noise):
+  with one thread per vCPU minus one, at most 4 (so 1 thread on 2 vCPU):
+  beyond 5 vCPU the encoder itself gets no faster (the apps still benefit).
+- **Measured** with the harness in [bench/](bench/) on a **4-vCPU host with
+  nothing else running**, the container limited with `docker run --cpus`,
+  software x264, H.264 to a real Chromium client (the image's own, headless,
+  on the same host: its decoding competes for the same 4 vCPU), 30 s per run,
+  2 interleaved repeats (a range = the two runs). CPU is % of one core. "Motion" =
+  `ls -lR /usr` scrolling in a terminal on the left half of the screen + a
+  Chromium page with a 60 Hz CSS animation; "rest" = everything else in the
+  container, mostly those apps (PulseAudio, nginx and XFCE add ~2). The `ls`
+  loop takes whatever CPU is left, so "rest" grows when streaming gets
+  cheaper; compare Selkies, Xvfb and fps.
 
-  | Workload | vCPU | Container CPU (% of one core) | Selkies / Xvfb / app | fps got / target | Mbit/s |
-  |---|---|---|---|---|---|
-  | Idle, no viewer | 2 | 1 | 0.6 / 0 / - | - | 0 |
-  | Idle, viewer connected, 1080p, static screen | 2 | 17-21 | 8 / 8 / - | 0 | 0 |
-  | Idle, tab hidden | 2 | 4 | 1.5 / 0 / - | - | 0 |
-  | Idle, desktop frozen (apps open) | 4 | 0.9 | 0.6 / 0 / 0 | - | 0 |
-  | Terminal scroll + CSS animation, 720p, 30 fps target (potato) | 2 | 174 | 20 / 20 / 50 | 31 / 30 | 8.6 |
-  | Same, 720p60 | 2 | 185 | 34 / 21 / 49 | 60 / 60 | 17.5 |
-  | Same, 1080p60 | 2 | 182-196 (limit hit) | 44 / 35 / 58 | **40-45** / 60 | 20 |
-  | Same, 1080p60 | 4 | 230 | 58 / 41 / 67 | 57 / 60 | 25 |
-  | Same, **1440p, 120 fps target (ultra)** | 4 | 240 | 63 / 52 / 75 | **35** / 120 | 28 |
-  | Terminal scroll only, 1080p60 | 2 | 188 | 60 / 45 / - | 60 / 60 | **29** |
-  | Same motion, **`auto` default** (720p30) | 2 | 161 | 20 / 17 / - | 31 / 30 | 9.9 |
-  | Same motion, **`auto` default** (1080p30) | 4 | 224 | 36 / 37 / - | 31 / 30 | 17.7 |
-  | Idle, viewer connected, static screen, `auto` | 2 / 4 | 8 / 12 | - | 0 | 0 |
+  | Workload | vCPU | Profile → stream | Container CPU | Selkies / Xvfb / rest | fps got / target | Mbit/s |
+  |---|---|---|---|---|---|---|
+  | No viewer, nothing open | 2 or 4 | any | 1.0-1.1 | 0.6 / 0 / 0.4-0.5 | - | 0 |
+  | No viewer, Chromium animation left open | 2 | any | 36 | 0.5 / 0.9 / 35 | - | 746 packets out per min |
+  | Same, after the idle freeze | 2 | any | 1.1-1.3 | 0.5-0.7 / 0 / 0.6 (the watcher) | - | **0 packets** in 60 s |
+  | Viewer connected, still screen | 2 | `auto` → 720p30 | 8 | 3.5 / 2.2 / 1.9 | 0 / 30 | 0 |
+  | Same | 4 | `auto` → 1080p30 | 11-12 | 5.2 / 4.2 / 1.9 | 0 / 30 | 0 |
+  | Same | 2 | `balanced` → 1080p60 | 14 | 6.5 / 5.8 / 1.9 | 0 / 60 | 0 |
+  | Same, tab hidden (client sends STOP_VIDEO) | 2 | `balanced` → 1080p60 | 3.0-3.1 | 1.4 / 0 / 1.7 | - | 0 |
+  | Same, still screen | 4 | `ultra` → 1080p120 | 21-22 | 10.2 / 9.3 / 1.8 | 0 / 120 | 0 |
+  | Same | 4 | `ultra` → 1440p120 | 32-33 | 15.2 / 15.7 / 1.9 | 0 / 120 | 0 |
+  | Motion | 2 | **`auto` → 720p30** | 187-190 | 18 / 17 / 153 | 31 / 30 | 10.2 |
+  | Motion | 2 | `balanced` → 720p60 | 191 | 31 / 17 / 143 | 62 / 60 | 15.5 |
+  | Motion | 2 | `balanced` → 1080p60 | 200 (limit) | 47 / 33 / 120 | **50-52** / 60 | 20.3 |
+  | Motion | 4 | **`auto` → 1080p30** | 223-228 | 33 / 36 / 157 | 31 / 30 | 17.7 |
+  | Motion | 4 | `balanced` → 1080p60 | 233-235 | 57 / 37 / 140 | 61 / 60 | 25.8 |
+  | Motion | 2 | `ultra` → 720p120 | 193-197 | 53 / 21 / 121 | 115-118 / 120 | 29.3 |
+  | Motion | 4 | `ultra` → 720p120 | 195-198 | 57 / 20 / 120 | 119 / 120 | 30.6 |
+  | Motion | 4 | `ultra` → 1080p120 | 230-234 | 64 / 38 / 130 | **65-72** / 120 | 35.4 |
+  | Motion | 4 | `ultra` → **1440p120** | 251-254 | 66 / 53 / 133 | **41-44** / 120 | 33.7 |
+  | Terminal scroll only | 4 | `balanced` → 1080p60 | 177-183 | 53 / 36 / 90 | 61 / 60 | **26** |
+  | CSS animation only | 4 | `balanced` → 1080p60 | 124-127 | 44 / 8 / 75 | 62 / 60 | 3.7 |
 
-  What moves the needle: 1080p → 720p cuts streaming CPU ~45-54 % (and the
-  apps' own rendering ~44 %); 60 → 30 fps cuts Selkies CPU ~38-42 % (the
-  cost per frame is roughly constant on light motion; under constant motion
-  each 30-fps frame carries more change, 10 → 11.6 ms); CRF 25 → 28 cuts
-  bandwidth ~27 % (30: ~42 %) with no fps change. Codec/encoder switches
-  move things by about ±10 %. That is why `auto` starts at 30 fps on small
-  hosts: against the old 1080p60 default it is -53 % Selkies CPU and half
-  the bandwidth on 2 vCPU (the `bench/` harness reproduces every row;
-  `--cpuset` for the 2-vCPU ones).
+  PotatOS v1 (`balanced`, CRF 25) measured the same CPU as v2 `balanced`
+  within noise in every row, with 13-18 % more bandwidth (v2 uses CRF 28).
+  The 746 packets/min of the awake row come from the browser retrying the
+  network (the benchmark container is offline); with internet a browser with
+  a few tabs measured ~4 packets/s.
+
+  What moves the needle (same harness): 1080p → 720p at 60 fps cuts Selkies
+  CPU 41 %, Xvfb 52 %, the apps' own drawing (Chromium + terminal) 26 % and
+  bandwidth 39 %; 60 → 30 fps cuts Selkies CPU 42-43 % and bandwidth
+  31-34 % (the cost per frame is roughly constant). That is why `auto`
+  starts at 30 fps: on 2 vCPU, against the old 1080p60 default, it is -62 %
+  Selkies CPU, -48 % Xvfb and -58 % bandwidth, and it actually reaches its
+  target (31/30 fps instead of 50/60). Codec/encoder switches move things by
+  about ±10 %.
 - **2K at 120 fps is not reachable in software.** On 4 vCPU, 1440p costs
-  ~18 ms of CPU per frame and managed 35 fps; x264 cannot use more than 4
-  threads. "1440p at 30-60 fps on 6-8 dedicated vCPU" is realistic; 2K/120
-  needs a host with a GPU encoder (NVENC/VA-API), which Railway and
-  Codespaces do not have. The `ultra` profile allows it; it does not promise it.
-  For a PC with an NVIDIA card, see [the GPU variant](#your-own-gpu-pc-and-the-portal).
-- **A visible tab with nobody touching it is the real waste** (17-21 % of a
-  core at 1080p60 for a still screen: capture copies the screen every tick).
-  That is what the hidden-tab pause, the idle countdown and the idle freeze
-  are for.
-- **Bandwidth and Railway egress.** CRF mode ignores the bitrate cap on busy
-  screens: a 1080p60 terminal scroll measured 29 Mbit/s. Rule of thumb:
-  **GB per hour ≈ Mbit/s × 0.45**, so that scroll is ~13 GB/h, about $0.65/h
+  ~16 ms of Selkies CPU per frame (23 ms encode time) and managed 41-44 fps;
+  even 1080p120 reaches only 65-72 fps. 720p120 does work, on 2 vCPU too.
+  "1440p at 30-60 fps on 6-8 dedicated vCPU" is realistic; 2K/120 needs a
+  host with a GPU encoder (NVENC/VA-API), which Railway and Codespaces do not
+  have. The `ultra` profile allows it; it does not promise it. For a PC with
+  an NVIDIA card, see [the GPU variant](#your-own-gpu-pc-and-the-portal).
+- **A visible tab with nobody touching it is the real waste** (14 % of a
+  core at 1080p60 for a still screen, 21-33 % at 120 fps: capture copies the
+  screen every tick even when nothing changed). That is what the hidden-tab
+  pause, the idle countdown and the idle freeze are for. Turbo mode, which
+  re-encodes the still frames too, would make it 51 % (Selkies 7 → 42 %),
+  which is why PotatOS locks it off.
+- **Bandwidth and Railway egress.** In the default CRF mode the bitrate
+  setting does not cap anything: a 1080p60 terminal scroll measured 26 Mbit/s
+  with `SELKIES_VIDEO_BITRATE` at 2000, 8000 or 30000 alike. Rule of thumb:
+  **GB per hour ≈ Mbit/s × 0.45**, so that scroll is ~12 GB/h, about $0.60/h
   at Railway's $0.05/GB; a typical desktop session (2-6 Mbit/s) is 1-3 GB/h.
   To bound it, raise the CRF (`SELKIES_VIDEO_CRF=32,5-50`) or switch to
   constant bitrate (`SELKIES_RATE_CONTROL_MODE=cbr SELKIES_VIDEO_BITRATE=4000,500-8000`),
@@ -601,7 +636,9 @@ Chromium with a warning.
   Use the HUD, `potatos info` and `htop` to see what is going on.
 - **Client side:** any current Chrome, Edge, Firefox or Safari. The client
   decodes H.264 (usually in hardware) and draws it, which is far lighter than
-  running the apps. For very weak clients, use `potato` and a smaller browser
+  running the apps. Worst case measured, a Chromium decoding in software
+  without GPU compositing: 11 % of a core on a still 1080p60 screen, 50-100 %
+  with motion. For very weak clients, use `potato` and a smaller browser
   window.
 - **Latency:** mostly network round-trip time (the HUD shows it). Pick a
   server region near you; on Codespaces set the region by hand (`gh codespace
@@ -777,7 +814,9 @@ cd tests/e2e && npm install
 POTATOS_URL=http://localhost:3000 POTATOS_CONTAINER=potatos node desktop.test.mjs
 
 # Reproduce the performance numbers (one fresh container + real H.264 client per run):
-cd bench && npm install && ./run-matrix.sh matrix-example.txt 2 results.jsonl && node summarize.mjs results.jsonl --base anim-base
+# (4-vCPU host, nothing else running; needs images potatos:v1 and potatos:v2, see bench/README.md)
+cd bench && npm install && PORT=6300 ./run-matrix.sh matrix-readme.txt 2 readme.jsonl && node summarize.mjs readme.jsonl
+./noviewer.sh frozen potatos:v2 2 30 POTATOS_IDLE_SECONDS=20      # the frozen row: CPU + outbound packets
 ```
 
 The e2e test uses `playwright-core` with an already installed Chromium

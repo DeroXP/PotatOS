@@ -15,6 +15,11 @@
 //      clock's once-a-minute redraw must not restart the timer)
 //  10. hidden tab -> the static paused page, the server sees 0 sessions, Resume;
 //      a tab that is ALREADY hidden when the page loads pauses too
+//  12. hardening: the security headers are on the page and its assets, and the
+//      features they could break still work: mic + webcam on (fake devices,
+//      Permissions-Policy camera/microphone=self), clipboard both ways
+//      (clipboard-read/write=self), and the paused page's Resume never leaves
+//      this origin (open-redirect guard)
 //  11. (POTATOS_CONTAINER only) session restore: Chromium with 2 tabs, freeze
 //      checkpoint, `docker kill` + a NEW container on the same /config volume
 //      (new host name = the Railway sleep/wake and redeploy path: the stale
@@ -242,8 +247,21 @@ async function main() {
       ? { username: process.env.POTATOS_USER || 'abc', password: process.env.POTATOS_PASSWORD }
       : undefined,
   });
+  await context.grantPermissions(['clipboard-read', 'clipboard-write', 'microphone', 'camera'], { origin: new globalThis.URL(URL).origin });
   const page = await context.newPage();
   page.on('console', (m) => { if (m.type() === 'error') log('page error:', m.text().slice(0, 200)); });
+  // Security headers (10-potatos-port) on the page and every static asset it loads.
+  const SEC_HEADERS = ['x-content-type-options', 'x-frame-options', 'content-security-policy', 'referrer-policy', 'permissions-policy'];
+  const headerGaps = new Set();
+  let throttled = 0;
+  page.on('response', async (r) => {
+    if (r.status() === 429) throttled++;
+    if (!r.url().startsWith(new globalThis.URL(URL).origin) || r.status() >= 300) return;
+    const h = await r.allHeaders().catch(() => ({}));
+    for (const k of SEC_HEADERS) if (!h[k]) headerGaps.add(`${k} missing on ${r.url()}`);
+  });
+  // The sidebar's own status messages say whether mic / webcam really started.
+  await page.addInitScript(() => { window.__sidebar = []; window.addEventListener('message', (e) => { if (e.data && e.data.type === 'sidebarButtonStatusUpdate') window.__sidebar.push(e.data); }); });
 
   const resp = await page.goto(URL, { waitUntil: 'domcontentloaded' });
   if (!resp || resp.status() !== 200) throw new Error(`page returned HTTP ${resp && resp.status()}`);
@@ -282,6 +300,46 @@ async function main() {
     if (got !== want) throw new Error(`expected codec ${want}, got ${got}`);
   }
   const desktop = await shot(page, box, '01-desktop.png');
+
+  // 12. Hardening: headers, and what a too-strict policy would break.
+  if (headerGaps.size) throw new Error(`security headers missing: ${[...headerGaps].slice(0, 5).join('; ')}`);
+  if (throttled) throw new Error(`${throttled} request(s) of a normal page load were rate-limited (429)`);
+  const sidebar = (key) => page.evaluate((k) => window.__sidebar.some((m) => m[k] === true), key);
+  const pipeline = (name, on) => page.evaluate(([n, e]) => window.postMessage({ type: 'pipelineControl', pipeline: n, enabled: e }, location.origin), [name, on]);
+  await pipeline('microphone', true);
+  await pipeline('webcam', true);
+  for (let i = 0; i < 10 && !((await sidebar('microphone')) && (await sidebar('webcam'))); i++) await sleep(1000);
+  const micOn = await sidebar('microphone'), camOn = await sidebar('webcam');
+  await pipeline('microphone', false);
+  await pipeline('webcam', false);
+  if (!micOn || !camOn) throw new Error(`mic/webcam did not start (mic ${micOn}, webcam ${camOn}): Permissions-Policy?`);
+  log('mic and webcam start with fake devices (Permissions-Policy allows this origin)');
+  if (CONTAINER) {
+    const clip = `potatos-clip-${Date.now() % 100000}`;
+    await page.evaluate((t) => navigator.clipboard.writeText(t), clip);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    let inDesktop = '';
+    for (let i = 0; i < 10 && inDesktop !== clip; i++) { await sleep(1000); inDesktop = inContainer('DISPLAY=:1 xclip -o -selection clipboard 2>/dev/null || true'); }
+    if (inDesktop !== clip) throw new Error(`clipboard browser -> desktop failed (desktop has "${inDesktop}")`);
+    const back = `potatos-back-${Date.now() % 100000}`;
+    inContainer(`printf %s ${back} | DISPLAY=:1 timeout 30 xclip -selection clipboard -loops 5 >/dev/null 2>&1 &`);
+    let inBrowser = '';
+    for (let i = 0; i < 15 && inBrowser !== back; i++) { await sleep(1000); inBrowser = await page.evaluate(() => navigator.clipboard.readText().catch((e) => `error ${e.name}`)); }
+    if (inBrowser !== back) throw new Error(`clipboard desktop -> browser failed (browser has "${inBrowser}")`);
+    log('clipboard works both ways');
+  }
+  {
+    // "/.//evil.example" normalises to "//evil.example", a different host if followed as a path
+    const guard = await context.newPage();
+    await guard.goto(`${URL.replace(/\/$/, '')}/potatos-paused.html#reason=idle&back=${encodeURIComponent('/.//evil.example/x')}`);
+    await guard.route('**/*', (r) => (new globalThis.URL(r.request().url()).hostname === 'evil.example' ? r.abort() : r.continue()));
+    await guard.click('#r');
+    await guard.waitForURL((u) => !/potatos-paused/.test(u.href), { timeout: 30_000 }).catch(() => {});
+    const landed = new globalThis.URL(guard.url());
+    await guard.close();
+    if (landed.origin !== new globalThis.URL(URL).origin) throw new Error(`paused page Resume left the origin: ${landed.href}`);
+    log(`paused page Resume with a crafted "back" stays on this origin (${landed.pathname})`);
+  }
 
   // 2. Mouse: right-click an empty spot of the desktop -> context menu.
   const cx = box.x + box.width * 0.55, cy = box.y + box.height * 0.30;
@@ -407,13 +465,24 @@ async function main() {
   // 8. Privacy shade: hidden tab -> blurred stream + overlay; click clears it.
   await setHidden(page, true);
   await sleep(500);
-  const blur = await page.evaluate(() => getComputedStyle(document.getElementById('videoCanvas')).filter);
+  // Covered by a blurred still of the last frame with the live element hidden,
+  // or (before the first frame) the live element itself CSS-blurred.
+  const blur = await page.evaluate(() => {
+    const still = document.getElementById('potatos-shade-still');
+    const live = [...document.querySelectorAll('#videoStream, #videoCanvas')];
+    if (still && still.width > 1 && live.every((e) => getComputedStyle(e).visibility === 'hidden')) return `blurred still ${still.width}x${still.height}`;
+    return live.map((e) => getComputedStyle(e).filter).find((f) => /blur/.test(f)) || 'none';
+  });
   await shot(page, box, '06-privacy-shade.png');
-  if (!/blur/.test(blur) || !(await page.isVisible('#potatos-shade'))) throw new Error(`privacy shade did not blur the stream (filter=${blur})`);
+  if (!/blur/.test(blur) || !(await page.isVisible('#potatos-shade'))) throw new Error(`privacy shade did not blur the stream (${blur})`);
   await setHidden(page, false);
   await page.mouse.click(cx, cy);
   await sleep(300);
   if (await page.isVisible('#potatos-shade')) throw new Error('privacy shade did not clear on click');
+  if (await page.evaluate(() => !!document.getElementById('potatos-shade-still')
+    || [...document.querySelectorAll('#videoStream, #videoCanvas')].some((e) => getComputedStyle(e).visibility === 'hidden' || /blur/.test(getComputedStyle(e).filter)))) {
+    throw new Error('privacy shade left the stream hidden or blurred after the click');
+  }
   log(`privacy shade: blurred while hidden (${blur}), cleared by a click`);
 
   // 9. Visible-idle countdown: 90 s of a static desktop instead of 30 min, so

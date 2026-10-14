@@ -11,9 +11,15 @@
 #
 # The generated password is stored in /config/.potatos/generated-password
 # (mode 600) so it stays the same across restarts when /config is a volume.
+# It is printed only when it is newly generated, not on every boot.
 # Delete that file to rotate it, or set PASSWORD yourself.
 # A password set at runtime with `potatos set-password` is kept as a hash in
 # /config/.potatos/htpasswd and re-applied here on every boot.
+#
+# Every login path also writes the nginx login rate limit (lib.sh
+# nginx_login_limit, see 10-potatos-port), makes /etc/nginx/.htpasswd
+# unreadable for the desktop user, and removes PASSWORD from the environment
+# the desktop and its apps inherit (/run/s6/container_environment).
 #
 # Also: the WebSocket origin guard (see SELKIES_ALLOWED_ORIGINS in the
 # Dockerfile). Basic auth alone does not stop a foreign web page from driving
@@ -23,10 +29,32 @@
 # shellcheck source=rootfs/usr/share/potatos/lib.sh
 . /usr/share/potatos/lib.sh        # NGINX_CONFIG (Alpine or Debian path)
 ENV_DIR=/run/s6/container_environment
-STATE_DIR=/config/.potatos
+STATE_DIR="${POTATOS_STATE_DIR}"
 PW_FILE="${STATE_DIR}/generated-password"
 SAVED_HTPASSWD="${STATE_DIR}/htpasswd"
 CUSER="${CUSTOM_USER:-abc}"
+LOGIN_HDR_FILE="${STATE_DIR}/login-header"   # "Basic ..." for the rate-limit key (set-password)
+
+# Runs before the desktop starts: no process of the desktop user can race this.
+state_dir_secure
+
+# Secrets the desktop does not need: nginx has its login by now, and Selkies'
+# own basic auth is off (SELKIES_ENABLE_BASIC_AUTH=false in the base image).
+# Every app started in the desktop would otherwise inherit them, and the
+# files here are world-readable.
+drop_secret_env() {
+  [ "$(cat "${ENV_DIR}/SELKIES_ENABLE_BASIC_AUTH" 2>/dev/null)" = "false" ] && rm -f "${ENV_DIR}/PASSWORD" "${ENV_DIR}/PASSWD"
+  rm -f "${ENV_DIR}/POTATOS_PASSWORD" "${ENV_DIR}/POTATOS_GH_TOKEN"
+}
+# login_on <"Basic ..." or empty>: auth lines on, htpasswd protected, rate limit keyed
+login_on() {
+  sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+  htpasswd_protect
+  nginx_login_limit "$1"
+  drop_secret_env
+}
+# An origin is scheme://host[:port], nothing else (no "*", no list, no path).
+origin_ok() { [[ "$1" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]]; }
 
 # --- WebSocket origin guard -------------------------------------------------
 if [[ ",${SELKIES_ALLOWED_ORIGINS// /}," == *",*,"* ]]; then
@@ -41,6 +69,7 @@ else
   if [ -r "${STATE_DIR}/allowed-origins" ]; then
     while IFS= read -r SAVED_ORIGIN; do
       [ -n "${SAVED_ORIGIN}" ] || continue
+      origin_ok "${SAVED_ORIGIN}" || { echo "[potatos] WARNING: ignoring saved origin '${SAVED_ORIGIN}' (not scheme://host[:port])"; continue; }
       if [[ ",${SELKIES_ALLOWED_ORIGINS}," != *",${SAVED_ORIGIN},"* ]]; then
         SELKIES_ALLOWED_ORIGINS="${SELKIES_ALLOWED_ORIGINS:+${SELKIES_ALLOWED_ORIGINS},}${SAVED_ORIGIN}"
       fi
@@ -60,15 +89,18 @@ fi
 # --- Login ------------------------------------------------------------------
 # PASSWORD already set -> the base image's init-nginx enabled auth for us.
 if [ -n "${PASSWORD}" ]; then
+  login_on "$(basic_auth_header "${CUSER}" "${PASSWORD}")"
   echo "[potatos] Password protection: ON (PASSWORD is set, user '${CUSER}')"
   exit 0
 fi
 
 # Password saved earlier with `potatos set-password`.
 if [ -s "${SAVED_HTPASSWD}" ]; then
-  install -m 644 "${SAVED_HTPASSWD}" /etc/nginx/.htpasswd
-  sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+  install -m 640 "${SAVED_HTPASSWD}" /etc/nginx/.htpasswd
+  HDR="$(cat "${LOGIN_HDR_FILE}" 2>/dev/null)"
+  login_on "${HDR}"
   echo "[potatos] Password protection: ON (set with 'potatos set-password', user '$(cut -d: -f1 "${SAVED_HTPASSWD}")')"
+  [ -n "${HDR}" ] || echo "[potatos] Login rate limit: off for this saved password (run 'potatos set-password' once more to turn it on)"
   exit 0
 fi
 
@@ -82,33 +114,38 @@ if [ -z "${REQUIRE}" ]; then
 fi
 
 if [ "${REQUIRE}" != "true" ]; then
+  nginx_login_limit ""
+  drop_secret_env
   echo "[potatos] Password protection: OFF (set PASSWORD to enable; fine for localhost / Codespaces private ports)"
   exit 0
 fi
 
-mkdir -p "${STATE_DIR}"
-chmod 700 "${STATE_DIR}"
-if [ -s "${PW_FILE}" ]; then
-  GEN_PW="$(cat "${PW_FILE}")"
-  SOURCE="reused from ${PW_FILE}"
-else
+NEW=0
+GEN_PW="$(cat "${PW_FILE}" 2>/dev/null)"
+if ! [[ "${GEN_PW}" =~ ^[[:graph:]]{8,128}$ ]]; then
   # 20 chars from [A-Za-z0-9]; no symbols so it is easy to type on a phone.
   GEN_PW="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
-  printf '%s' "${GEN_PW}" > "${PW_FILE}"
-  SOURCE="newly generated"
+  ( umask 077; printf '%s' "${GEN_PW}" > "${PW_FILE}" )
+  NEW=1
 fi
-chmod 600 "${PW_FILE}"
-chown -R root:root "${STATE_DIR}"
 
-# Same mechanism the base image uses when PASSWORD is set.
-printf '%s:%s\n' "${CUSER}" "$(openssl passwd -apr1 "${GEN_PW}")" > /etc/nginx/.htpasswd
-sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+# Same mechanism the base image uses when PASSWORD is set (the password goes
+# in on stdin: a command-line argument is visible to every process).
+printf '%s:%s\n' "${CUSER}" "$(printf '%s' "${GEN_PW}" | openssl passwd -apr1 -stdin)" > /etc/nginx/.htpasswd
+login_on "$(basic_auth_header "${CUSER}" "${GEN_PW}")"
 
+# The password goes to the log once, when it is generated; later boots only
+# say where it is kept (logs are often kept and shared longer than a volume).
+if [ "${NEW}" = 1 ]; then
 cat <<EOF
 [potatos] ###########################################################
-[potatos] #  PotatOS login (HTTP basic auth, ${SOURCE})
+[potatos] #  PotatOS login (HTTP basic auth, newly generated)
 [potatos] #    user:     ${CUSER}
 [potatos] #    password: ${GEN_PW}
 [potatos] #  Set the PASSWORD variable to choose your own.
 [potatos] ###########################################################
 EOF
+else
+  echo "[potatos] Password protection: ON (user '${CUSER}'; the generated password was printed in the log of the boot that created it)"
+  echo "[potatos]   Kept in ${PW_FILE} (root-only). Lost it? Set the PASSWORD variable, or delete that file for a new one."
+fi

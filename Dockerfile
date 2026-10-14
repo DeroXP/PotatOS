@@ -2,9 +2,13 @@
 # (Alpine image. Dockerfile.gpu is the Debian/NVENC variant built from the same rootfs/.)
 #
 # Base: linuxserver/webtop (Alpine + XFCE + Selkies streaming + nginx + s6).
-# `latest` tracks upstream security fixes. For reproducible builds, pin a digest:
+# `latest` is kept on purpose: a rebuild picks up upstream security fixes.
+# For a reproducible build, pin the digest (or a version tag) instead:
 #   docker build --build-arg BASE_IMAGE=linuxserver/webtop@sha256:529034b4cb77ac4ba3368b7667b50ebeb0c4b054943981d462c035a56ae4308b .
-# (that digest is the one PotatOS was last tested against, Alpine 3.24 / Selkies 2.x)
+#   docker build --build-arg BASE_IMAGE=linuxserver/webtop:4436569b-ls319 .
+# Last tested against: build 4436569b-ls319 (2026-10-10, Alpine 3.24,
+# Chromium 152, nginx 1.30, Selkies 2.x), digest above. Check yours with
+#   docker image inspect linuxserver/webtop:latest --format '{{index .Config.Labels "build_version"}}'
 ARG BASE_IMAGE=linuxserver/webtop:latest
 FROM ${BASE_IMAGE}
 
@@ -49,7 +53,8 @@ RUN if [ -n "${POTATOS_APK_PACKAGES}" ]; then apk add --no-cache ${POTATOS_APK_P
 #   SELKIES_ENCODER - empty marker: 20-potatos-profile writes the profile's
 #       codec list unless you set one yourself.
 #   SELKIES_VIDEO_STREAMING_MODE - "Turbo" re-encodes identical frames (a still
-#       desktop costs 5x the CPU) and one sidebar click would stick in the
+#       1080p60 desktop with a viewer: 51 % of a core instead of 14 %, measured
+#       on 4 vCPU, see bench/) and one sidebar click would stick in the
 #       browser's localStorage, so it is locked off. Set "true" to allow it.
 ENV SELKIES_ALLOWED_ORIGINS= \
     SELKIES_ENCODER= \
@@ -57,7 +62,9 @@ ENV SELKIES_ALLOWED_ORIGINS= \
 
 # Init scripts, the potatos-idle service (s6-rc, see below), launchers, wallpaper, first-boot XFCE
 # defaults (/defaults/xfce/*.xml: wallpaper, session saving; only used for a
-# fresh /config), Firefox policies and the `potatos` helper CLI.
+# fresh /config), Chromium and Firefox policies (/etc/chromium/policies/managed,
+# /etc/firefox/policies: no telemetry, metrics or promo traffic, see README
+# Security) and the `potatos` helper CLI.
 # Web client: brand the tab title and inject the PotatOS add-ons (HUD, eco
 # mode, pause pages...) into every dashboard. init-nginx copies the dashboard
 # directory to /usr/share/selkies/web on each boot, so these edits survive;
@@ -68,7 +75,8 @@ ENV SELKIES_ALLOWED_ORIGINS= \
 COPY rootfs/ /
 RUN chmod 755 /custom-cont-init.d/* /etc/s6-overlay/s6-rc.d/svc-potatos-idle/run /usr/local/bin/potatos* /usr/local/bin/chromium \
  && chmod 644 /usr/share/potatos/launchers/*.desktop /etc/xdg/autostart/potatos-session.desktop \
-      /etc/firefox/policies/policies.json /usr/share/selkies/selkies-dashboard/potatos* \
+      /etc/firefox/policies/policies.json /etc/chromium/policies/managed/potatos.json \
+      /usr/share/selkies/selkies-dashboard/potatos* \
  && for d in /usr/share/selkies/selkies-dashboard*/; do \
       cp -n /usr/share/selkies/selkies-dashboard/potatos* "$d" 2>/dev/null || true; \
       sed -i -e 's#<title>Selkies</title>#<title>PotatOS</title>#' \

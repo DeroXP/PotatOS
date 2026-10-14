@@ -58,7 +58,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.7-alpine   # pinned (tested); bump deliberately, see `docker manifest inspect caddy:<version>-alpine`
     container_name: potatos-caddy
     ports:
       - "80:80"         # ACME HTTP-01 + redirect to HTTPS (optional, see docs)

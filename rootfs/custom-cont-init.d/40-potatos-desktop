@@ -18,17 +18,23 @@
 # (rootfs/defaults/xfce/*.xml), which the base image copies only when the
 # user has no XFCE config yet.
 
+# Files in the home directory are written AS abc (s6-setuidgid), never as
+# root: the desktop user owns /config and could have put a symlink where a
+# file is expected, and root would then write, copy or chown through it.
+# Only the markers in the root-only /config/.potatos are written as root.
+
 HOME_DIR="${HOME:-/config}"
 DESKTOP_DIR="${FILE_MANAGER_PATH:-${HOME_DIR}/Desktop}"
 MARKER="${HOME_DIR}/.potatos/desktop-seeded-v1"
 LAUNCHERS=/usr/share/potatos/launchers
 ENV_DIR=/run/s6/container_environment
 
-mkdir -p "${HOME_DIR}/.potatos"
-
 # --- default browser ---------------------------------------------------------
 # shellcheck source=rootfs/usr/share/potatos/lib.sh
-. /usr/share/potatos/lib.sh        # browser_bin / browser_desktop / browser_helper
+. /usr/share/potatos/lib.sh        # browser_bin / browser_desktop / browser_helper, state_dir_secure
+state_dir_secure                   # /config/.potatos: root-only (30-potatos-security did it already)
+# as_user FUNCTION ARGS...: run a function of this script as abc
+as_user() { s6-setuidgid abc bash -c "$(declare -f "$1"); \"\$@\"" _ "$@"; }
 BROWSER="${POTATOS_BROWSER:-chromium}"; BROWSER="${BROWSER,,}"
 case "${BROWSER}" in
   chromium|firefox) ;;
@@ -42,20 +48,24 @@ printf '%s' "${BROWSER}" > "${ENV_DIR}/POTATOS_BROWSER"
 BROWSER_MARKER="${HOME_DIR}/.potatos/browser"
 MIMEAPPS="${HOME_DIR}/.config/mimeapps.list"
 HELPERS="${HOME_DIR}/.config/xfce4/helpers.rc"
-if [ "$(cat "${BROWSER_MARKER}" 2>/dev/null)" != "${BROWSER}" ]; then
-  DESKTOP_ID="$(browser_desktop "${BROWSER}")"
-  echo "[potatos] Default web browser: ${BROWSER} (${DESKTOP_ID})"
-  mkdir -p "${HOME_DIR}/.config/xfce4"
+seed_browser() {                   # seed_browser MIMEAPPS HELPERS DESKTOP_ID HELPER  (runs as abc)
+  local MIMEAPPS="$1" HELPERS="$2" DESKTOP_ID="$3"
+  mkdir -p "$(dirname "${HELPERS}")"
   # xdg-open / Thunar: mimeapps.list (replace our previous entries, keep the rest)
   [ -f "${MIMEAPPS}" ] || printf '[Default Applications]\n' > "${MIMEAPPS}"
   sed -i -E '/^(x-scheme-handler\/(http|https)|text\/html|application\/xhtml\+xml)=(chromium|firefox|firefox-esr|google-chrome|brave-browser)\.desktop$/d' "${MIMEAPPS}"
   sed -i "s#^\[Default Applications\]#[Default Applications]\nx-scheme-handler/http=${DESKTOP_ID}\nx-scheme-handler/https=${DESKTOP_ID}\ntext/html=${DESKTOP_ID}\napplication/xhtml+xml=${DESKTOP_ID}#" "${MIMEAPPS}"
   # exo-open / XFCE "Web Browser" entries: helpers.rc
   if [ -f "${HELPERS}" ]; then sed -i '/^WebBrowser=/d' "${HELPERS}"; fi
-  printf 'WebBrowser=%s\n' "$(browser_helper "${BROWSER}")" >> "${HELPERS}"
+  printf 'WebBrowser=%s\n' "$4" >> "${HELPERS}"
   grep -q '^TerminalEmulator=' "${HELPERS}" || printf 'TerminalEmulator=xfce4-terminal\nFileManager=thunar\n' >> "${HELPERS}"
-  chown -R abc:abc "${HOME_DIR}/.config/xfce4" "${MIMEAPPS}"
-  printf '%s' "${BROWSER}" > "${BROWSER_MARKER}"
+}
+if [ "$(cat "${BROWSER_MARKER}" 2>/dev/null)" != "${BROWSER}" ]; then
+  DESKTOP_ID="$(browser_desktop "${BROWSER}")"
+  echo "[potatos] Default web browser: ${BROWSER} (${DESKTOP_ID})"
+  as_user seed_browser "${MIMEAPPS}" "${HELPERS}" "${DESKTOP_ID}" "$(browser_helper "${BROWSER}")" \
+    || echo "[potatos] WARNING: could not set the default browser in ${MIMEAPPS} / ${HELPERS}"
+  ( umask 077; printf '%s' "${BROWSER}" > "${BROWSER_MARKER}" )
 fi
 
 # --- session restore across host names ---------------------------------------
@@ -64,8 +74,7 @@ CUR="${SESSIONS}/xfce4-session-$(hostname):1"
 if [ -d "${SESSIONS}" ] && [ ! -e "${CUR}" ]; then
   # shellcheck disable=SC2012
   NEWEST="$(ls -t "${SESSIONS}"/xfce4-session-*:1 2>/dev/null | head -1)"
-  if [ -n "${NEWEST}" ]; then
-    cp -p "${NEWEST}" "${CUR}" && chown abc:abc "${CUR}"
+  if [ -n "${NEWEST}" ] && s6-setuidgid abc cp -p "${NEWEST}" "${CUR}"; then
     echo "[potatos] Session restore: using the session saved as $(basename "${NEWEST}")"
   fi
 fi
@@ -76,20 +85,23 @@ if [ -f "${MARKER}" ]; then
 fi
 
 echo "[potatos] First boot: adding desktop launchers"
-mkdir -p "${DESKTOP_DIR}"
-for src in "${LAUNCHERS}"/*.desktop; do
-  dst="${DESKTOP_DIR}/$(basename "${src}")"
-  if [ ! -e "${dst}" ]; then
-    cp "${src}" "${dst}"
-    # Desktop launchers must be executable to be runnable from xfdesktop.
-    chmod 755 "${dst}"
+seed_launchers() {                 # seed_launchers DESKTOP_DIR LAUNCHERS  (runs as abc)
+  local src dst
+  mkdir -p "$1"
+  for src in "$2"/*.desktop; do
+    dst="$1/$(basename "${src}")"
+    if [ ! -e "${dst}" ] && [ ! -L "${dst}" ]; then
+      cp "${src}" "${dst}"
+      # Desktop launchers must be executable to be runnable from xfdesktop.
+      chmod 755 "${dst}"
+    fi
+  done
+  # GitHub Codespaces: a container rebuild wipes /config; only /workspaces
+  # survives. Put a shortcut to it on the desktop so files land somewhere safe.
+  if [ -d /workspaces ] && [ ! -e "$1/workspaces" ]; then
+    ln -s /workspaces "$1/workspaces"
   fi
-done
-# GitHub Codespaces: a container rebuild wipes /config; only /workspaces
-# survives. Put a shortcut to it on the desktop so files land somewhere safe.
-if [ -d /workspaces ] && [ ! -e "${DESKTOP_DIR}/workspaces" ]; then
-  ln -s /workspaces "${DESKTOP_DIR}/workspaces"
-fi
-chown -R abc:abc "${DESKTOP_DIR}"
+}
+as_user seed_launchers "${DESKTOP_DIR}" "${LAUNCHERS}" || echo "[potatos] WARNING: could not add the desktop launchers to ${DESKTOP_DIR}"
 
-touch "${MARKER}"
+( umask 077; : > "${MARKER}" )

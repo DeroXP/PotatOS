@@ -6,12 +6,14 @@ button{font:inherit;padding:.8em 1.6em;border-radius:8px;border:0;background:#e0
 <script>
 // Static page, no connection: a tab parked here does not keep the server awake.
 // Resume = probe the server (wakes a sleeping Railway service), then go back.
-// This page is served without a login, so `back` is only followed when it is
-// a path on this very origin (no "//evil" or "/\evil" open redirects).
+// This page is served without a login, so `back` is only followed when it
+// resolves to this very origin, and it is followed as an ABSOLUTE URL: a
+// relative path such as "/.//evil.example" normalises to "//evil.example",
+// which the browser would read as another host (open redirect).
 const q = new URLSearchParams(location.hash.slice(1));
 const reason = q.get('reason') || 'hidden';
-let back = './';
-try { const u = new URL(q.get('back') || './', location.href); if (u.origin === location.origin && !/^\/[\/\\]/.test(q.get('back') || '')) back = u.pathname + u.search; } catch {}
+let back = new URL('./', location.href).href;
+try { const u = new URL(q.get('back') || './', location.href); if (u.origin === location.origin) back = location.origin + u.pathname + u.search; } catch {}
 document.getElementById('why').textContent = {
   hidden: 'This tab was in the background, so it let go of the desktop. Your apps keep running.',
   idle: 'Nothing happened for a while, so this tab let go of the desktop. Your apps keep running.',

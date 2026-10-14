@@ -13,8 +13,15 @@
 # shellcheck source=rootfs/usr/share/potatos/lib.sh
 . /usr/share/potatos/lib.sh
 
-PKGS="${POTATOS_EXTRA_PACKAGES//,/ }"
-if [ -z "${PKGS// /}" ]; then
+PKGS=""
+# Package names only (lib.sh pkg_name_ok): an option such as --allow-untrusted
+# or a file / URL is dropped, not passed to the package manager as root.
+read -r -a WANT <<< "${POTATOS_EXTRA_PACKAGES//,/ }"     # (no glob expansion)
+for p in "${WANT[@]}"; do
+  if pkg_name_ok "${p}"; then PKGS="${PKGS:+${PKGS} }${p}"
+  else echo "[potatos] WARNING: POTATOS_EXTRA_PACKAGES: '${p}' is not a package name, skipped"; fi
+done
+if [ -z "${PKGS}" ]; then
   exit 0
 fi
 

@@ -88,6 +88,10 @@ cmd_idle() {
 
 cmd_install() {
   [ $# -gt 0 ] || { echo "usage: potatos install <package>..." >&2; exit 2; }
+  # Package names only (lib.sh pkg_name_ok): no options such as
+  # --allow-untrusted / --repository, no local files or URLs.
+  local p
+  for p in "$@"; do pkg_name_ok "${p}" || { echo "potatos: '${p}' is not a package name" >&2; exit 2; }; done
   echo "Installing with ${POTATOS_PKG}: $*"
   echo "(Packages live in the container, not /config. To keep them across"
   echo " re-deploys, add them to the POTATOS_EXTRA_PACKAGES variable.)"
@@ -172,21 +176,27 @@ wait_for_boot() {
 # re-applied on every boot by 30-potatos-security.
 cmd_set_password() {
   local pw="${1:-${POTATOS_PASSWORD:-${PASSWORD:-}}}" user line
+  state_dir_secure
   if [ "${pw}" = "--off" ]; then
-    rm -f "${STATE_DIR}/htpasswd"
+    rm -f "${STATE_DIR}/htpasswd" "${STATE_DIR}/login-header"
     sed -i -E 's/^([[:space:]]*)auth_basic/\1#auth_basic/' "${NGINX_CONFIG}"
+    nginx_login_limit ""
     nginx_reload
     echo "Password protection OFF (a PASSWORD variable, if set, turns it back on at the next start)."
     return 0
   fi
   [ -n "${pw}" ] || { echo "usage: potatos set-password <password>   (or set POTATOS_PASSWORD / PASSWORD)" >&2; exit 2; }
   user="$(envval CUSTOM_USER)"; user="${user:-abc}"
-  line="${user}:$(openssl passwd -apr1 "${pw}")"
-  mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
-  ( umask 077; printf '%s\n' "${line}" > "${STATE_DIR}/htpasswd" )
+  # (stdin, not an argument: every process can read command lines)
+  line="${user}:$(printf '%s' "${pw}" | openssl passwd -apr1 -stdin)"
+  # The hash, plus the browser's header value for the login rate-limit key,
+  # both root-only, re-applied at every boot by 30-potatos-security.
+  ( umask 077; printf '%s\n' "${line}" > "${STATE_DIR}/htpasswd"
+    basic_auth_header "${user}" "${pw}" > "${STATE_DIR}/login-header" )
   printf '%s\n' "${line}" > /etc/nginx/.htpasswd
-  chmod 644 /etc/nginx/.htpasswd
+  htpasswd_protect
   sed -i 's/#auth_basic/auth_basic/g' "${NGINX_CONFIG}"
+  nginx_login_limit "$(cat "${STATE_DIR}/login-header")"
   nginx_reload
   echo "Password protection ON (user '${user}')."
 }
@@ -197,6 +207,11 @@ cmd_set_password() {
 cmd_allow_origin() {
   local origin="${1:-}" cur
   [ -n "${origin}" ] || { echo "usage: potatos allow-origin https://host[:port]" >&2; exit 2; }
+  # One origin, exactly scheme://host[:port]: a "*" or a comma-separated list
+  # would widen the WebSocket origin guard (see README Security).
+  [[ "${origin}" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] \
+    || { echo "potatos: '${origin}' is not an origin like https://host[:port]" >&2; exit 2; }
+  state_dir_secure
   cur="$(envval SELKIES_ALLOWED_ORIGINS)"
   case ",${cur}," in
     *",${origin},"*|*",*,"*) echo "origin already allowed: ${origin}"; return 0 ;;
@@ -204,7 +219,6 @@ cmd_allow_origin() {
   printf '%s' "${cur:+${cur},}${origin}" > "${ENV_DIR}/SELKIES_ALLOWED_ORIGINS"
   # Remember it: the s6 environment is rebuilt on every boot, and
   # 30-potatos-security re-applies this list.
-  mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
   grep -qxF "${origin}" "${STATE_DIR}/allowed-origins" 2>/dev/null \
     || { umask 077; printf '%s\n' "${origin}" >> "${STATE_DIR}/allowed-origins"; }
   echo "allowed origin: ${origin} (kept across restarts)"
@@ -230,7 +244,7 @@ cmd_codespaces_setup() {
   # The codespace name is stored next to it: the watcher service may not see
   # CODESPACE_NAME in its environment.
   if [ -n "${POTATOS_GH_TOKEN:-}" ]; then
-    mkdir -p "${STATE_DIR}" && chmod 700 "${STATE_DIR}"
+    state_dir_secure
     ( umask 077; printf '%s' "${POTATOS_GH_TOKEN}" > "${STATE_DIR}/gh-token"
       printf '%s' "${CODESPACE_NAME:-}" > "${STATE_DIR}/codespace-name" )
     if [ -n "${CODESPACE_NAME:-}" ]; then

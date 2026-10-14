@@ -9,6 +9,8 @@
 #
 #   docker build -f Dockerfile.gpu -t potatos:gpu .
 #   docker build -f Dockerfile.gpu --build-arg POTATOS_APT_PACKAGES= -t potatos:gpu .   # offline
+# Pinning works as in Dockerfile; last tested against build 67f288dc-ls216
+# (2026-10-10), linuxserver/webtop@sha256:905f733f124b10a58e8d187c9f46d67be8c81e31c75b30e1125174b692d5adfc
 ARG BASE_IMAGE=linuxserver/webtop:debian-xfce
 FROM ${BASE_IMAGE}
 
@@ -51,11 +53,13 @@ ENV SELKIES_ALLOWED_ORIGINS= \
 #     directly; route it through the PotatOS wrapper (shm fallback, session
 #     restore), which calls wrapped-chromium itself on Debian.
 #   - Firefox ESR policies: Debian's ESR reads /etc/firefox-esr/policies and
-#     its distribution/ directory, not only /etc/firefox/policies.
+#     its distribution/ directory, not only /etc/firefox/policies. (Debian's
+#     Chromium reads /etc/chromium/policies/managed, the same path as Alpine.)
 COPY rootfs/ /
 RUN chmod 755 /custom-cont-init.d/* /etc/s6-overlay/s6-rc.d/svc-potatos-idle/run /usr/local/bin/potatos* /usr/local/bin/chromium \
  && chmod 644 /usr/share/potatos/launchers/*.desktop /etc/xdg/autostart/potatos-session.desktop \
-      /etc/firefox/policies/policies.json /usr/share/selkies/selkies-dashboard/potatos* \
+      /etc/firefox/policies/policies.json /etc/chromium/policies/managed/potatos.json \
+      /usr/share/selkies/selkies-dashboard/potatos* \
  && sed -i 's#^Exec=/usr/local/bin/wrapped-chromium#Exec=/usr/local/bin/chromium#' /usr/share/applications/chromium.desktop \
  && mkdir -p /etc/firefox-esr/policies \
  && cp /etc/firefox/policies/policies.json /etc/firefox-esr/policies/policies.json \

@@ -198,22 +198,33 @@ checkpoint() {
   # At shutdown ($2 = keep) a browser may already be gone: never replace a
   # recorded list with an empty one then.
   [ "${2:-}" = keep ] && [ -z "${apps}" ] && return 0
-  mkdir -p "$(dirname "${APPS_FILE}")"
-  printf '%s\n' "${apps# }" > "${APPS_FILE}"
-  chown "${DESK_UID}" "${APPS_FILE}" "$(dirname "${APPS_FILE}")" 2>/dev/null || true
+  # Written AS the desktop user: the file is in that user's home, where a
+  # symlink planted in its place must not make root write (or chown) elsewhere.
+  printf '%s\n' "${apps# }" | s6-setuidgid "${DESK_USER}" sh -c 'mkdir -p "${1%/*}" && cat > "$1"' _ "${APPS_FILE}" 2>/dev/null \
+    || log "WARNING: could not write ${APPS_FILE}"
 }
 
 # --- freeze / thaw --------------------------------------------------------
 write_state() { printf 'state=%s\nsince=%s\nreason="%s"\nclients=%s\nidle_seconds=%s\naction=%s\n' "$1" "${EPOCHSECONDS}" "$2" "${CLIENTS}" "${IDLE}" "${ACTION}" > "${STATE}/state"; }
 
+# Is this process entirely the desktop user's? All four uids (real, effective,
+# saved, filesystem) must be DESK_UID: a set-uid program the user started
+# (sudo, su, a set-uid helper) keeps the user's REAL uid but runs as root, and
+# root must not stop or kill it on the user's behalf.
+desk_owned() {
+  local key r e sv fs
+  while read -r key r e sv fs; do
+    [ "${key}" = "Uid:" ] && { [ "${r}" = "${DESK_UID}" ] && [ "${e}" = "${DESK_UID}" ] && [ "${sv}" = "${DESK_UID}" ] && [ "${fs}" = "${DESK_UID}" ]; return; }
+  done 2>/dev/null < "$1/status"
+  return 1
+}
+
 freeze() {
-  local d pid uid comm cmd key val n=0 cut=0
+  local d pid comm cmd n=0 cut=0
   : > "${FROZEN_LIST}"
   for d in /proc/[0-9]*; do
     pid="${d#/proc/}"
-    uid=""
-    while read -r key val _; do [ "${key}" = "Uid:" ] && { uid="${val}"; break; }; done 2>/dev/null < "${d}/status"
-    [ "${uid}" = "${DESK_UID}" ] || continue
+    desk_owned "${d}" || continue
     comm="$(< "${d}/comm")" 2>/dev/null || continue
     [[ "${KEEP_COMM}" == *" ${comm} "* ]] && continue
     cmd="$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)"
@@ -225,7 +236,9 @@ freeze() {
   done
   # Close the browsers' sockets: the network service of Chromium / Chrome /
   # Brave, Firefox's socket process. The browsers respawn it when they continue.
+  # (only the desktop user's: a command line is free text anyone can fake)
   for d in /proc/[0-9]*; do
+    desk_owned "${d}" || continue
     cmd="$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)"
     if [[ "${cmd}" == *--utility-sub-type=network.mojom.NetworkService* ]] || [[ "${cmd}" == *firefox*" socket " ]]; then
       kill -KILL "${d#/proc/}" 2>/dev/null && cut=$((cut + 1))
@@ -243,6 +256,7 @@ thaw() {
   [ -s "${FROZEN_LIST}" ] || { rm -f "${FROZEN_LIST}"; return; }
   while read -r pid st; do
     [ "$(starttime "${pid}" 2>/dev/null)" = "${st}" ] || continue
+    desk_owned "/proc/${pid}" || continue
     kill -CONT "${pid}" 2>/dev/null && n=$((n + 1))
   done < "${FROZEN_LIST}"
   rm -f "${FROZEN_LIST}"
@@ -252,16 +266,24 @@ thaw() {
 # The codespace name is visible to devcontainer lifecycle scripts (which is
 # where `potatos codespaces-setup` saves it) but not always to services.
 CS_NAME="${CODESPACE_NAME:-$(cat "${GH_NAME_FILE}" 2>/dev/null)}"
-if [ -r "${GH_TOKEN_FILE}" ]; then
+[[ "${CS_NAME}" =~ ^[A-Za-z0-9._-]*$ ]] || { log "WARNING: ignoring codespace name '${CS_NAME}'"; CS_NAME=""; }
+# The token is read once, here, and only from a plain root-owned file with a
+# single link (/config is the desktop user's: see state_dir_secure in lib.sh).
+GH_TOKEN=""
+if [ -f "${GH_TOKEN_FILE}" ] && [ ! -L "${GH_TOKEN_FILE}" ] && [ "$(stat -c '%u %h' "${GH_TOKEN_FILE}" 2>/dev/null)" = "0 1" ]; then
+  GH_TOKEN="$(< "${GH_TOKEN_FILE}")"
+  [[ "${GH_TOKEN}" =~ ^[A-Za-z0-9_]+$ ]] || { log "WARNING: ${GH_TOKEN_FILE} does not look like a GitHub token, ignored"; GH_TOKEN=""; }
+fi
+if [ -n "${GH_TOKEN}" ]; then
   if [ -n "${CS_NAME}" ]; then log "codespace ${CS_NAME} will be stopped after the idle timeout (POTATOS_GH_TOKEN found)"
   else log "WARNING: POTATOS_GH_TOKEN found but no codespace name: run 'potatos codespaces-setup'"; fi
 fi
 stop_codespace() {
-  [ -n "${CS_NAME}" ] && [ -r "${GH_TOKEN_FILE}" ] || return 0
+  [ -n "${CS_NAME}" ] && [ -n "${GH_TOKEN}" ] || return 0
   local code
   # The token goes in through curl's config on stdin, not the command line
   # (which every user in the container can read in /proc/*/cmdline).
-  code="$(printf 'header = "Authorization: Bearer %s"\n' "$(< "${GH_TOKEN_FILE}")" \
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "${GH_TOKEN}" \
     | curl --config - -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
       -H 'Accept: application/vnd.github+json' "https://api.github.com/user/codespaces/${CS_NAME}/stop" 2>/dev/null)"
   case "${code}" in

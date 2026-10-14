@@ -14,10 +14,21 @@
 #   3-4  vCPU : 30 fps initial (up to 60), window-sized (1080p-friendly)
 #   >= 5 vCPU : balanced, 60 fps initial (up to 120)
 #   CODESPACES=true never starts above 60 fps.
-# Speed defaults shared by every profile (measured, see bench/): Turbo
-# ("stream every frame") locked off, CRF 28 (about -27% bandwidth vs 25 and
-# -8% encoder CPU, same fps; CRF 30 would be -42%), compositor off (base
-# image default), Opus at 64/96/128 kbps.
+# Speed defaults shared by every profile (measured on a 4-vCPU host with
+# software x264, see bench/ and the README's performance table):
+#   - Turbo ("stream every frame") locked off: a still 1080p60 desktop with a
+#     viewer costs 14% of a core with it off, 51% with it on.
+#   - CRF 28: -13 to -27% bandwidth vs CRF 25 depending on the content, same
+#     fps and CPU (CRF 30 would be -42%).
+#   - SELKIES_VIDEO_BITRATE is only the CBR target (when the user switches the
+#     sidebar to CBR). In CRF mode it is x264's VBV cap but does not bind: a
+#     1080p60 terminal scroll measured 26.2 Mbit/s with 2000, 8000 and 30000
+#     alike, so lowering it is not a bandwidth lever (raise the CRF instead).
+#   - compositor off (base image default), Opus at 64/96/128 kbps.
+# Measured and deliberately NOT set: RAYON_NUM_THREADS=1 (pixelflux's pool;
+# within +-1.5% on still and moving screens at --cpus 2 and 4); x264's thread
+# count has no knob (pixelflux uses vCPU-1, so 1 thread at 2 vCPU, where the
+# container is CPU-bound anyway).
 #
 # A profile only fills in Selkies settings the user did NOT set. Anything you
 # pass yourself as SELKIES_<NAME>=... always wins. Values are written to

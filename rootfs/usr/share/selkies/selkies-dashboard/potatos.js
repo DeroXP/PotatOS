@@ -16,7 +16,8 @@
 //                 once a minute makes a 1-2 s burst of 5-6 fps, which must not
 //                 restart a 30-minute timer.
 //   privacy shade tab hidden (or window blurred, mode "focus") -> the stream is
-//                 blurred until a click or key press
+//                 blurred until a click or key press (shown as a blurred still
+//                 of its last frame, see the shade section for why)
 //   quiet hours   inside the window, no input for quietInputMinutes -> paused page
 //
 // How settings are applied: the Selkies sidebar posts
@@ -137,18 +138,68 @@
   document.addEventListener('visibilitychange', onVisibility);
 
   // --- privacy shade ------------------------------------------------------
+  // The live stream is hidden behind a blurred still of its last frame: one
+  // drawImage into a 1/16-size canvas (smoothed, plus a 1 px canvas blur),
+  // which the browser scales back up. A CSS blur on the live <video>/<canvas>
+  // looks the same but is recomputed for every video frame and for every HUD
+  // update drawn over it. Measured on a client without GPU compositing
+  // (headless Chromium, 1080p60, bench.mjs --shaded, 2 runs each): shade up on
+  // a still screen 51-55 % of a core with the CSS blur, 10 % with the still
+  // (11 % without a shade); with a moving screen 130 % vs 35-36 % (50-52 %
+  // without a shade: the hidden live element is not composited at all). Revealing is instant:
+  // the live element kept receiving frames. Until a frame exists (e.g. back
+  // from the paused page, still connecting) the CSS blur is the fallback and
+  // the 1 s tick swaps in a still as soon as it can.
+  const liveView = () => [...document.querySelectorAll('#videoStream, #videoCanvas')]
+    .find((e) => e.getBoundingClientRect().width > 1) || null;
+  function blurredStill(src) {
+    const W = src.videoWidth || src.width, H = src.videoHeight || src.height;
+    if (!(W > 1 && H > 1) || (src.tagName === 'VIDEO' && src.readyState < 2)) return null;
+    try {
+      const s = document.createElement('canvas');
+      const x = s.getContext('2d');
+      const k = 'filter' in x ? 16 : 32;   // no canvas filter (Safari): scale down further instead
+      s.width = Math.max(1, Math.round(W / k)); s.height = Math.max(1, Math.round(H / k));
+      x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+      if (k === 16) x.filter = 'blur(1px)';
+      x.drawImage(src, 0, 0, s.width, s.height);
+      return s;
+    } catch { return null; }
+  }
   const shade = {
-    box: null,
+    box: null, still: null, src: null,
     show() {
       if (this.box) return;
       this.box = el('div', 'potatos-shade', 'PotatOS: click or press a key to show the desktop');
       this.box.addEventListener('click', (e) => { e.stopPropagation(); this.hide(); });
       document.body.appendChild(this.box);
-      document.body.classList.add('potatos-shaded');
+      document.body.classList.add('potatos-shaded');   // CSS blur until the still is up
+      this.freeze();
     },
-    hide() { if (!this.box) return; this.box.remove(); this.box = null; document.body.classList.remove('potatos-shaded'); },
+    freeze() {
+      if (!this.box || this.still) return;
+      const src = liveView();
+      const s = src && blurredStill(src);
+      if (!s) return;
+      s.id = 'potatos-shade-still';
+      this.still = s; this.src = src; this.place();
+      document.body.appendChild(s);
+      document.body.classList.add('potatos-still');    // hides the live element (potatos.css)
+    },
+    place() {
+      if (!this.still) return;
+      const r = this.src.getBoundingClientRect();      // still laid out while visibility:hidden
+      Object.assign(this.still.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+    },
+    hide() {
+      if (!this.box) return;
+      this.box.remove(); this.box = null;
+      if (this.still) { this.still.remove(); this.still = null; this.src = null; }
+      document.body.classList.remove('potatos-shaded', 'potatos-still');
+    },
   };
   window.addEventListener('keydown', () => shade.hide(), { capture: true, passive: true });
+  window.addEventListener('resize', () => shade.place());
   if (C.shade === 'focus') window.addEventListener('blur', () => shade.show());
 
   // --- HUD ----------------------------------------------------------------
@@ -206,6 +257,7 @@
       const moving = motionRun >= C.motionSeconds;  // frames keep arriving = screen really changing
       hud.tick();
       eco.tick();
+      shade.freeze();   // shaded before the first frame: swap the CSS blur for a still
       if (document.hidden || moving || now() - lastInput < 1000) { staticSince = now(); if (moving) countdown.cancel(); }
       const idleMs = now() - lastInput;
       // Test hook + what the HUD shows, available even with the HUD off.
